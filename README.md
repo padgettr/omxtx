@@ -26,3 +26,9 @@ You should have received a copy of the GNU General Public License along
 with this program; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+
+example
+=======
+trancoding h264 > h264 lower bitrate, stream url must end with .flv
+
+./omxtx -b 512000 -r 640x360 rtmp://hostname/live/livefull.flv rtmp://hostname/feed/live512k.flv

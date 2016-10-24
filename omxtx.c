@@ -48,6 +48,7 @@
 
 //#define DEBUG
 
+#define VERSION 0.1
 #define _DEFAULT_SOURCE
 
 #include <stdio.h>
@@ -58,7 +59,7 @@
 #include "bcm_host.h"
 #include "libavformat/avformat.h"
 #include "libavutil/avutil.h"
-#include "libavcodec/avcodec.h"
+//#include "libavcodec/avcodec.h"
 #include "libavutil/mathematics.h"
 #include "libavformat/avio.h"
 #include <error.h>
@@ -461,9 +462,7 @@ static const char *mapComponent(struct context *ctx, OMX_HANDLETYPE handle) {
 static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname, int idx, const OMX_PARAM_PORTDEFINITIONTYPE *prt) {
    const OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
    AVFormatContext   *oc=NULL;
-   int ret;
    AVStream          *iflow, *oflow;
-   AVCodec           *videoEnc;
 
    viddef = &prt->format.video; /* Decoder output format structure */
 
@@ -475,33 +474,37 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       exit(1);
    }
 
-   videoEnc = avcodec_find_encoder(AV_CODEC_ID_H264); /* Return allocated AVCodec structure, or NULL if not found */
    iflow = ic->streams[ctx.inVidStreamIdx];
-   oflow = avformat_new_stream(oc, videoEnc); /* Stream 0 */
+   oflow = avformat_new_stream(oc, NULL); /* Stream 0 */
+
+   
    if (!oflow) {
       av_log(NULL, AV_LOG_ERROR, "Failed allocating output stream\n");
       exit(1);
    }
-   oflow->codec->width=viddef->nFrameWidth;   /* Set  AVCodecContext details to OMX_VIDEO reported values */
-   oflow->codec->height = viddef->nFrameHeight;
-   oflow->codec->bit_rate = ctx.bitrate;   /* User specified bit rate or default */
-   oflow->codec->profile = FF_PROFILE_H264_HIGH;
-   oflow->codec->level = 41;   /* The profile level: hard coded here to 4.1 */
-   oflow->codec->time_base = iflow->codec->time_base; /* Set encoder timebase: Should be 1/frame rate */
+   oflow->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+   oflow->codecpar->codec_id = AV_CODEC_ID_H264;
+      
+   oflow->codecpar->width = viddef->nFrameWidth;   /* Set  AVCodecContext details to OMX_VIDEO reported values */
+   oflow->codecpar->height = viddef->nFrameHeight;
+   oflow->codecpar->bit_rate = ctx.bitrate;   /* User specified bit rate or default */
+   oflow->codecpar->profile = FF_PROFILE_H264_HIGH;
+   oflow->codecpar->level = 41;   /* The profile level: hard coded here to 4.1 */
+
    oflow->time_base = iflow->time_base;               /* Set timebase hint for muxer: will be overwritten on header write depending on container format */
-   oflow->codec->pix_fmt = videoEnc->pix_fmts[0]; // TODO: should match up with OMX formats!
+   oflow->codecpar->format = AV_PIX_FMT_YUV420P; // TODO: should match up with OMX formats!
    oflow->avg_frame_rate = iflow->avg_frame_rate; /* Set framerate of output stream */
    oflow->r_frame_rate = iflow->r_frame_rate;
    oflow->start_time=iflow->start_time;
 
    if ((ctx.userFlags & UFLAGS_RESIZE)==0) { /* If resizing use default 1:1 pixel aspect, otherwise copy apect ratio from input */
-      oflow->codec->sample_aspect_ratio.num = iflow->codec->sample_aspect_ratio.num;
-      oflow->codec->sample_aspect_ratio.den = iflow->codec->sample_aspect_ratio.den;
-      oflow->sample_aspect_ratio.num = iflow->codec->sample_aspect_ratio.num;
-      oflow->sample_aspect_ratio.den = iflow->codec->sample_aspect_ratio.den;
+      oflow->codecpar->sample_aspect_ratio.num = iflow->codecpar->sample_aspect_ratio.num;
+      oflow->codecpar->sample_aspect_ratio.den = iflow->codecpar->sample_aspect_ratio.den;
+      oflow->sample_aspect_ratio.num = iflow->codecpar->sample_aspect_ratio.num;
+      oflow->sample_aspect_ratio.den = iflow->codecpar->sample_aspect_ratio.den;
    }
-   if (oc->oformat->flags & AVFMT_GLOBALHEADER)
-      oflow->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+   //if (oc->oformat->flags & AVFMT_GLOBALHEADER)
+   //   oflow->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
    printf("\n\n\n");
    if (ctx.inAudioStreamIdx>0) {
@@ -509,15 +512,27 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       printf("*** Mapping input audio stream #%i to output audio stream #%i ***\n\n", ctx.inAudioStreamIdx, 1);
       iflow = ic->streams[ctx.inAudioStreamIdx];
       oflow = avformat_new_stream(oc, NULL); /* Stream 1 */
-      ret = avcodec_copy_context(oc->streams[1]->codec, ic->streams[ctx.inAudioStreamIdx]->codec);
+      oflow->codecpar->codec_type = iflow->codecpar->codec_type;
+      
+      oflow->codecpar->codec_id = iflow->codecpar->codec_id;
+      oflow->codecpar->codec_tag = iflow->codecpar->codec_tag;
+      oflow->codecpar->format = iflow->codecpar->format;
+      oflow->codecpar->bit_rate = iflow->codecpar->bit_rate;
+      oflow->codecpar->bits_per_coded_sample = iflow->codecpar->bits_per_coded_sample;
+      oflow->codecpar->bits_per_raw_sample = iflow->codecpar->bits_per_raw_sample;
+      oflow->codecpar->channel_layout = iflow->codecpar->channel_layout;
+      oflow->codecpar->channels = iflow->codecpar->channels;
+      oflow->codecpar->sample_rate = iflow->codecpar->sample_rate;
+      oflow->codecpar->block_align = iflow->codecpar->block_align;
+      oflow->codecpar->frame_size = iflow->codecpar->frame_size;
+      oflow->codecpar->initial_padding = iflow->codecpar->initial_padding;
+      oflow->codecpar->trailing_padding = iflow->codecpar->trailing_padding;
+      oflow->codecpar->seek_preroll = iflow->codecpar->seek_preroll;
       oflow->time_base = iflow->time_base; /* Time base hint */
       oflow->start_time=iflow->start_time;
-      if (ret < 0) {
-          av_log(NULL, AV_LOG_ERROR, "Copying stream context failed\n");
-          exit(1);
-      }
-      if (oc->oformat->flags & AVFMT_GLOBALHEADER)
-         oflow->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+      //if (oc->oformat->flags & AVFMT_GLOBALHEADER)
+      //   oflow->codecpar->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
    }
 
    printf("Input:\n");
@@ -557,7 +572,7 @@ static int openOutput(struct context *ctx, int nalType) {
    int i, ret;
    struct packetentry *packet, *next;
    AVFormatContext *oc;
-   AVCodecContext *cc;
+   AVCodecParameters *cc;
 
    if (nalType == 7) {          /* This NAL is of type sequence parameter set */
       ctx->nalEntry.sps = ctx->nalEntry.nalBuf; /* Take ref */
@@ -585,7 +600,7 @@ static int openOutput(struct context *ctx, int nalType) {
 
    printf("Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
    oc = ctx->oc;
-   cc = ctx->oc->streams[0]->codec;
+   cc = ctx->oc->streams[0]->codecpar;
 
    if (cc->extradata) { /* Delete any existing data */
       av_free(cc->extradata);
@@ -864,60 +879,16 @@ static OMX_BUFFERHEADERTYPE *allocbufs(OMX_HANDLETYPE h, int port) {
    return list;
 }
 
-static AVBitStreamFilterContext *dofiltertest(AVPacket *rp) {
-   AVBitStreamFilterContext *bsfc;
-   bsfc = NULL;
+static int dofiltertest(AVPacket *rp) {
 
    if (!(rp->buf->data[0] == 0x00 && rp->buf->data[1] == 0x00 && rp->buf->data[2] == 0x00 && rp->buf->data[3] == 0x01)) {
-      bsfc = av_bitstream_filter_init("h264_mp4toannexb");
-      if (!bsfc) {
-         printf("Failed to open filter.  This is bad.\n");
-      } else {
-         printf("Have a filter at %p\n", bsfc);
-      }
-   } else
-      printf("No need for a filter.\n");
-
-   return bsfc;
-}
-
-/* Filter packet and return filtered packet, or original packet on error */
-static AVPacket *filter(struct context *ctx, AVPacket *rp) {
-   AVPacket *fp;
-   int rc=-1;
-
-   //if (rp->buf !=NULL)
-     //printf ("buf=%ld, size=%ld, pkt->data=%ld, pkt->size=%ld\n",rp->buf->data, rp->buf->size, rp->data, rp->size);
-
-   fp = av_packet_alloc();
-   if (fp!=NULL) {
-      if (av_packet_copy_props(fp, rp)==0) {
-         rc = av_bitstream_filter_filter(ctx->bsfc, ctx->ic->streams[ctx->inVidStreamIdx]->codec, NULL, &(fp->data), &(fp->size), rp->data, rp->size, rp->flags & AV_PKT_FLAG_KEY);
-      }
+      printf("h264 input data required to be in annex b format. Use, e.g:\n");
+      printf("\tffmpeg -i INPUT.mp4 -codec copy -bsf:v h264_mp4toannexb OUTPUT.ts\n");
+      printf("to convert before processing.\n");
+      return 1;
    }
 
-   if (rc > 0) {  /* Success */
-      fp->buf = av_buffer_create(fp->data, fp->size, av_buffer_default_free, NULL, 0);
-      if (fp->buf != NULL) {
-         av_packet_free(&rp);
-         return fp;
-      }
-   }
-
-   if (rc < 0) {  /* Failed */
-      printf("\nFailed to filter frame: %d (%x)\n", rc, rc);
-      if (fp!=NULL) av_packet_free(&fp);
-      return rp;
-   }
-
-   /* rc == 0 : fp->data may point to rp->data, or not ? */
-   if (fp->data != rp->data)
-      av_free(fp->data);
-
-   fp->data=NULL;
-   fp->size=0;
-   av_packet_free(&fp);
-   return rp;
+   return 0;
 }
 
 /* Request a component to change state and optionally wait:
@@ -1011,14 +982,14 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureResizer(struct context *ctx, OMX_P
    }
 
    if (ctx->userFlags & UFLAGS_AUTO_SCALE_X) {
-      ctx->outputWidth = imgdef->nFrameWidth*ctx->ic->streams[ctx->inVidStreamIdx]->codec->sample_aspect_ratio.num/ctx->ic->streams[ctx->inVidStreamIdx]->codec->sample_aspect_ratio.den;
+      ctx->outputWidth = imgdef->nFrameWidth*ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->sample_aspect_ratio.num/ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->sample_aspect_ratio.den;
       ctx->outputWidth += 0x0f;
       ctx->outputWidth &= ~0x0f;
       ctx->outputHeight = imgdef->nFrameHeight;
    }
 
    if (ctx->userFlags & UFLAGS_AUTO_SCALE_Y) {
-      ctx->outputHeight = imgdef->nFrameHeight*ctx->ic->streams[ctx->inVidStreamIdx]->codec->sample_aspect_ratio.den/ctx->ic->streams[ctx->inVidStreamIdx]->codec->sample_aspect_ratio.num;
+      ctx->outputHeight = imgdef->nFrameHeight*ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->sample_aspect_ratio.den/ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->sample_aspect_ratio.num;
       ctx->outputHeight += 0x0f;
       ctx->outputHeight &= ~0x0f;
       ctx->outputWidth = imgdef->nFrameWidth;
@@ -1362,9 +1333,9 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
    portdef->nPortIndex = PORT_DEC;
    OERR(OMX_GetParameter(ctx->dec, OMX_IndexParamPortDefinition, portdef));
    viddef = &portdef->format.video;
-   viddef->nFrameWidth = ctx->ic->streams[ctx->inVidStreamIdx]->codec->width;
-   viddef->nFrameHeight = ctx->ic->streams[ctx->inVidStreamIdx]->codec->height;
-   viddef->eCompressionFormat = mapCodec(ctx->ic->streams[ctx->inVidStreamIdx]->codec->codec_id);
+   viddef->nFrameWidth = ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->width;
+   viddef->nFrameHeight = ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->height;
+   viddef->eCompressionFormat = mapCodec(ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id);
    viddef->bFlagErrorConcealment = 0;
 
    OERR(OMX_SetParameter(ctx->dec, OMX_IndexParamPortDefinition, portdef));
@@ -1630,7 +1601,7 @@ static int openInputFile(struct context *ctx) {
       }
    }
    ctx->ic=ic;
-   return ic->streams[ctx->inVidStreamIdx]->codec->codec_id;   /* Return the codec ID for the video stream */
+   return ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id;   /* Return the codec ID for the video stream */
 }
 
 static int examineNAL(struct context *ctx) {
@@ -1852,17 +1823,13 @@ int main(int argc, char *argv[]) {
                fprintf(stderr, "Can't zero last packet buffer for flush!\n");
          }
          else {
-            av_packet_free(&p); /* Free previous rp packet from decoder */
-
+            av_packet_free(&p); /* Free previous packet from decoder */
+            p = rp;
+            rp=NULL; /* Ref is passed to p */
             if (filtertest) { /* If input is h264, expecting annex B */
                filtertest = 0; // Don't do this next time round
-               ctx.bsfc = dofiltertest(rp);
+               if(dofiltertest(p)==1) exit(1);
             }
-            if (ctx.bsfc)
-               p = filter(&ctx, rp); /* rp is freed here, or returned by filter */
-            else
-               p = rp;
-            rp=NULL; /* Ref is passed to p */
             
             /* From ffmpeg docs: pkt->pts can be AV_NOPTS_VALUE (-9223372036854775808) if the video format has B-frames, so it is better to rely on pkt->dts if you do not decompress the payload */
             switch (ctx.ptsOpt) {
@@ -1949,8 +1916,6 @@ int main(int argc, char *argv[]) {
    
    if (ctx.oc) {
       av_write_trailer(ctx.oc);
-      avcodec_close(ctx.oc->streams[0]->codec);
-      avcodec_close(ctx.oc->streams[1]->codec);
       avio_close(ctx.oc->pb);
    }
    else

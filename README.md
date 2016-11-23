@@ -34,14 +34,20 @@ format of h264 in a matroska container, e.g:
 I used this as a project to learn some openmax, so the code has been changed a fair bit to aid
 my understanding.
 
-Dr. R. Padgett, October 2016
+To try out vp8 decoding requires:
+            start_file=start_x.elf
+            fixup_file=fixup_x.dat
+in /boot/config.txt
+            
+Dr. R. Padgett, November 2016
 
 Copyright
 =========
 
 omxtx - OpenMAX transcoder for the Raspberry Pi
 Copyright (C) 2012, 2013 Dickon Hood <dickon@fluff.org>
-              2014 - 2016 Rodney Padgett <rod_padgett@hotmail.com>
+
+This version 2014 - 2016 Rodney Padgett <rod_padgett@hotmail.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

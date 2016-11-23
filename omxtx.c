@@ -388,14 +388,16 @@ static void exitHandler(void) {
 static int mapCodec(enum AVCodecID id) {
    printf("Mapping codec ID %d (%x)\n", id, id);
    switch (id) {
-      case   AV_CODEC_ID_MPEG2VIDEO:
-      case   AV_CODEC_ID_MPEG2VIDEO_XVMC:
+      case AV_CODEC_ID_MPEG2VIDEO:
+      case AV_CODEC_ID_MPEG2VIDEO_XVMC:
          return OMX_VIDEO_CodingMPEG2;
-      case   AV_CODEC_ID_H264:
+      case AV_CODEC_ID_H264:
          return OMX_VIDEO_CodingAVC;
-      case   8:
+      case AV_CODEC_ID_VP8:
+         return OMX_VIDEO_CodingVP8;
+      case AV_CODEC_ID_MJPEG:
          return OMX_VIDEO_CodingMJPEG;
-      case   13:
+      case AV_CODEC_ID_MPEG4:
          return OMX_VIDEO_CodingMPEG4;
       default:
          return -1;
@@ -564,7 +566,7 @@ static void writeAudioPacket(AVPacket *pkt) {
    // fprintf(stderr,"Audio PTS %lld\n", pkt->pts);
    ret=av_interleaved_write_frame(ctx.oc, pkt);   /* This frees pkt */
    if (ret < 0) {
-      fprintf(stderr, "Failed to write non-video frame.\n");
+      fprintf(stderr, "ERROR:omxtx: Failed to write audio frame.\n");
    }
 }
 
@@ -578,7 +580,7 @@ static int openOutput(struct context *ctx, int nalType) {
       ctx->nalEntry.sps = ctx->nalEntry.nalBuf; /* Take ref */
       ctx->nalEntry.nalBuf=av_malloc(ctx->nalEntry.nalBufSize); /* Alloc new memory for nal data */
       if (ctx->nalEntry.nalBuf==NULL) {
-         fprintf(stderr,"ERROR: Can't allocate memory for nalBuf\n");
+         fprintf(stderr,"ERROR:omxtx: Can't allocate memory for nalBuf\n");
          exit(1);
       }
       ctx->nalEntry.spsSize = ctx->nalEntry.nalBufOffset;
@@ -588,7 +590,7 @@ static int openOutput(struct context *ctx, int nalType) {
       ctx->nalEntry.pps = ctx->nalEntry.nalBuf;
       ctx->nalEntry.nalBuf=av_malloc(ctx->nalEntry.nalBufSize);
       if (ctx->nalEntry.nalBuf==NULL) {
-         fprintf(stderr,"ERROR: Can't allocate memory for nalBuf\n");
+         fprintf(stderr,"ERROR:omxtx: Can't allocate memory for nalBuf\n");
          exit(1);
       }
       ctx->nalEntry.ppsSize = ctx->nalEntry.nalBufOffset;
@@ -612,7 +614,7 @@ static int openOutput(struct context *ctx, int nalType) {
    cc->extradata = av_malloc(cc->extradata_size);
    memcpy(cc->extradata, ctx->nalEntry.sps, ctx->nalEntry.spsSize);
    memcpy(&cc->extradata[ctx->nalEntry.spsSize], ctx->nalEntry.pps, ctx->nalEntry.ppsSize);
-         
+
    if (!(oc->oformat->flags & AVFMT_NOFILE)) {
      ret = avio_open(&oc->pb, ctx->oname, AVIO_FLAG_WRITE);
      if (ret < 0) {
@@ -633,6 +635,18 @@ static int openOutput(struct context *ctx, int nalType) {
    ctx->nalEntry.ppsSize=0;
 
    if (ctx->inAudioStreamIdx>0) {
+      if (ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata) {
+         printf("WARNING: extradata in audio stream: TODO!\n");
+         cc = ctx->oc->streams[1]->codecpar;
+         if (cc->extradata) { /* Delete any existing data */
+            av_free(cc->extradata);
+            cc->extradata = NULL;
+            cc->extradata_size = 0;
+         }
+         cc->extradata_size=ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size;
+         cc->extradata = av_malloc(cc->extradata_size);
+         memcpy(cc->extradata, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size);
+      }
       printf("Writing saved audio packets out...");
       for (i = 0, packet = TAILQ_FIRST(&packetq); packet; packet = next) {
          next = TAILQ_NEXT(packet, link);
@@ -1378,7 +1392,7 @@ static void usage(const char *name) {
       "\n"
       "Output container is guessed based on filename.  Use '.nal' for raw output.\n"
       "\n"
-      "Input file must contain one of MPEG 2, H.264, or MJPEG video\n"
+      "Input file must contain one of MPEG 2, H.264, MPEG4 (H.623), MJPEG or vp8 video.\n"
       "\n", name);
    exit(1);
 }

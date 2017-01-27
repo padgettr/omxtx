@@ -1,0 +1,10 @@
+Is it worth using more than 1 encoder buffer?
+* No - the slowest component is the encoder, so adding extra output buffers won't help. If output media was slow, it might be worth having two buffers so that whilst one was being written another could be getting filled. However, transcoding a DVD to H264 2Mb/s typically runs about 4X realtime, i.e. about 8Mb/s or 1MB/s which doesn't require speed - a USB stick will do just fine. To test this, try transcoding to ram disk - about the fastest IO you can do on the PI - the frame rate is similar.
+
+What is 'encoder time'?
+* This is the rough time in seconds that the output buffer was empty (i.e. nothing to do) during the empty encoder buffer loop. Numbers close to zero would indicate a fast encode, which would probably benefit from more encoder buffers and a separate thread for the encoder buffer empty. Does not include time taken writing output file to disk; however this is generally very small compared to the encode time. Really only any use during development.
+
+Why won't vp8 / mjpeg decode work?
+* start_file=start_x.elf
+  fixup_file=fixup_x.dat
+  is required in /boot/config.txt. Note that these are not hardware decoders, they are built into the firmware as software decoders running on the gpu, so expect little cpu usage.

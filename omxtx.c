@@ -13,7 +13,7 @@
  * Usage: type ./omxtx after make for usage / options
  *
  * This version has been substantially changed to add new functionality, and
- * compatibility with ffmpeg 3.0.2
+ * compatibility with ffmpeg 3.2.2
  * 
  *
  * Dr. R. Padgett <rod_padgett@hotmail.com> May 2016
@@ -150,10 +150,6 @@ TAILQ_HEAD(packetqueue, packetentry);
 static struct packetqueue packetq;
 
 typedef struct {
-   uint8_t *sps;
-   uint8_t *pps;
-   int spsSize;
-   int ppsSize;
    uint8_t *nalBuf;
    uint32_t nalBufSize; /* 32 bit: maximum buffer size 4GB! */
    off_t nalBufOffset;
@@ -165,14 +161,14 @@ static struct context {
    AVFormatContext *oc;    /* Output context for muxer */
    OMXTX_NAL_ENTRY nalEntry;  /* Store for NAL header info */
    int      raw_fd;        /* File descriptor for raw output file */
-   volatile uint64_t framecount;
-   volatile uint16_t userFlags;      /* User command line switch flags */
-   volatile uint8_t componentFlags;
+   uint16_t userFlags;      /* User command line switch flags */
+   volatile _Atomic uint64_t framecount;
+   volatile _Atomic uint8_t componentFlags;
+   volatile _Atomic int encBufferFilled;
+   volatile _Atomic enum states state;
    OMX_BUFFERHEADERTYPE *encbufs;
    OMX_BUFFERHEADERTYPE *decbufs;
    volatile uint64_t encWaitTime;
-   volatile int encBufferFilled;
-   volatile enum states   state;
    int      inVidStreamIdx;
    int      inAudioStreamIdx; /* <0 if there is no audio stream */
    int      userAudioStreamIdx;
@@ -181,17 +177,16 @@ static struct context {
    int64_t  videoPTS;
    OMX_HANDLETYPE   dec, enc, rsz, dei, spl, vid;
    pthread_mutex_t decBufLock;
-   pthread_mutex_t encBufLock;
-   pthread_mutex_t cmpFlagLock;
    AVBitStreamFilterContext *bsfc;
-   int          bitrate;
-   volatile float omxFPS;
-   char     *iname;
-   char     *oname;
+   int   bitrate;
+   float omxFPS;
+   char  *iname;
+   char  *oname;
    AVRational omxtimebase;
    OMX_CONFIG_RECTTYPE *cropRect;
    int outputWidth;
    int outputHeight;
+   int naluInputFormat;   /* 1 if input is h264 annexb, 0 otherwise */ 
 } ctx;
 
 /* Command line option flags */
@@ -542,7 +537,6 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
    printf("\nOutput:\n");
    av_dump_format(oc, 0, oname, 1);
 
-
    return oc;
 }
 
@@ -570,83 +564,38 @@ static void writeAudioPacket(AVPacket *pkt) {
    }
 }
 
-static int openOutput(struct context *ctx, int nalType) {
+static int openOutput(struct context *ctx) {
    int i, ret;
    struct packetentry *packet, *next;
-   AVFormatContext *oc;
-   AVCodecParameters *cc;
-
-   if (nalType == 7) {          /* This NAL is of type sequence parameter set */
-      ctx->nalEntry.sps = ctx->nalEntry.nalBuf; /* Take ref */
-      ctx->nalEntry.nalBuf=av_malloc(ctx->nalEntry.nalBufSize); /* Alloc new memory for nal data */
-      if (ctx->nalEntry.nalBuf==NULL) {
-         fprintf(stderr,"ERROR:omxtx: Can't allocate memory for nalBuf\n");
-         exit(1);
-      }
-      ctx->nalEntry.spsSize = ctx->nalEntry.nalBufOffset;
-      printf("New SPS, length %d\n", ctx->nalEntry.spsSize);
-   }
-   else if (nalType == 8) {   /* This NAL is of type picture parameter set */
-      ctx->nalEntry.pps = ctx->nalEntry.nalBuf;
-      ctx->nalEntry.nalBuf=av_malloc(ctx->nalEntry.nalBufSize);
-      if (ctx->nalEntry.nalBuf==NULL) {
-         fprintf(stderr,"ERROR:omxtx: Can't allocate memory for nalBuf\n");
-         exit(1);
-      }
-      ctx->nalEntry.ppsSize = ctx->nalEntry.nalBufOffset;
-      printf("New PPS, length %d\n", ctx->nalEntry.ppsSize);
-   }
-
-   if (ctx->nalEntry.pps==NULL || ctx->nalEntry.sps==NULL)
-      return 1; /* Can't open output yet: no pps / sps data */
 
    printf("Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
-   oc = ctx->oc;
-   cc = ctx->oc->streams[0]->codecpar;
 
-   if (cc->extradata) { /* Delete any existing data */
-      av_free(cc->extradata);
-      cc->extradata = NULL;
-      cc->extradata_size = 0;
+   if (ctx->inAudioStreamIdx>0) {
+      if (ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata) {
+         printf(" Found extradata in audio stream: WIP!\n");
+         if (av_reallocp(&ctx->oc->streams[1]->codecpar->extradata, ctx->oc->streams[1]->codecpar->extradata_size + ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE) == 0) {
+            memcpy(ctx->oc->streams[1]->codecpar->extradata + ctx->oc->streams[1]->codecpar->extradata_size, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size);
+            ctx->oc->streams[1]->codecpar->extradata_size += ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size;
+            memset(ctx->oc->streams[1]->codecpar->extradata + ctx->oc->streams[1]->codecpar->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE); /* Add extra zeroed bytes to prevent certain optimised readers from reading past the end */
+         }
+      }
    }
-            
-   cc->extradata_size = ctx->nalEntry.ppsSize + ctx->nalEntry.spsSize;
-   cc->extradata = av_malloc(cc->extradata_size);
-   memcpy(cc->extradata, ctx->nalEntry.sps, ctx->nalEntry.spsSize);
-   memcpy(&cc->extradata[ctx->nalEntry.spsSize], ctx->nalEntry.pps, ctx->nalEntry.ppsSize);
 
-   if (!(oc->oformat->flags & AVFMT_NOFILE)) {
-     ret = avio_open(&oc->pb, ctx->oname, AVIO_FLAG_WRITE);
+   if (!(ctx->oc->oformat->flags & AVFMT_NOFILE)) {
+     ret = avio_open(&ctx->oc->pb, ctx->oname, AVIO_FLAG_WRITE);
      if (ret < 0) {
          fprintf(stderr, "Could not open output file '%s'\n", ctx->oname);
          exit(1);
      }
    }
    /* init muxer, write output file header */
-   ret = avformat_write_header(oc, NULL);
+   ret = avformat_write_header(ctx->oc, NULL);
    if (ret < 0) {
      av_log(NULL, AV_LOG_ERROR, "Error occurred when opening output file\n");
      exit(1);
    }
-   
-   av_free(ctx->nalEntry.sps);
-   av_free(ctx->nalEntry.pps);
-   ctx->nalEntry.spsSize=0;
-   ctx->nalEntry.ppsSize=0;
 
    if (ctx->inAudioStreamIdx>0) {
-      if (ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata) {
-         printf("WARNING: extradata in audio stream: TODO!\n");
-         cc = ctx->oc->streams[1]->codecpar;
-         if (cc->extradata) { /* Delete any existing data */
-            av_free(cc->extradata);
-            cc->extradata = NULL;
-            cc->extradata_size = 0;
-         }
-         cc->extradata_size=ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size;
-         cc->extradata = av_malloc(cc->extradata_size);
-         memcpy(cc->extradata, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size);
-      }
       printf("Writing saved audio packets out...");
       for (i = 0, packet = TAILQ_FIRST(&packetq); packet; packet = next) {
          next = TAILQ_NEXT(packet, link);
@@ -658,6 +607,7 @@ static int openOutput(struct context *ctx, int nalType) {
 
       printf("done.  Wrote %d frames.\n\n", i);
    }
+
    printf("Press ctrl-c to abort\n");
    return 0;
 }
@@ -672,7 +622,6 @@ OMX_ERRORTYPE genericEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OM
 }
 
 OMX_ERRORTYPE decEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
-   pthread_mutex_lock(&ctx->cmpFlagLock);
    switch (event) {
       case OMX_EventPortSettingsChanged:
          ctx->state = TUNNELSETUP; /* Port setting identified (decoder needs some frames to setup port parameters) call configure() from main loop to set up tunnels now we have those settings */
@@ -690,12 +639,10 @@ OMX_ERRORTYPE decEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
       default:
          genericEventHandler(handle, ctx, event, data1, data2, eventdata);
    }
-   pthread_mutex_unlock(&ctx->cmpFlagLock);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE encEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
-   pthread_mutex_lock(&ctx->cmpFlagLock);
    switch (event) {
       case OMX_EventError:
          fprintf(stderr, "ERROR:%s %p: %x\n", mapComponent(ctx, handle), handle, data1);
@@ -709,12 +656,10 @@ OMX_ERRORTYPE encEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
       default:
          genericEventHandler(handle, ctx, event, data1, data2, eventdata);
    }
-   pthread_mutex_unlock(&ctx->cmpFlagLock);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE rszEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
-   pthread_mutex_lock(&ctx->cmpFlagLock);
    switch (event) {
       case OMX_EventError:
          fprintf(stderr, "ERROR:%s %p: %x\n", mapComponent(ctx, handle), handle, data1);
@@ -729,12 +674,10 @@ OMX_ERRORTYPE rszEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
       default:
          genericEventHandler(handle, ctx, event, data1, data2, eventdata);
    }
-   pthread_mutex_unlock(&ctx->cmpFlagLock);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE deiEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
-   pthread_mutex_lock(&ctx->cmpFlagLock);
    switch (event) {
       case OMX_EventError:
          fprintf(stderr, "ERROR:%s %p: %x\n", mapComponent(ctx, handle), handle, data1);
@@ -748,12 +691,10 @@ OMX_ERRORTYPE deiEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
       default:
          genericEventHandler(handle, ctx, event, data1, data2, eventdata);
    }
-   pthread_mutex_unlock(&ctx->cmpFlagLock);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE splEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
-   pthread_mutex_lock(&ctx->cmpFlagLock);
    switch (event) {
       case OMX_EventError:
          fprintf(stderr, "ERROR:%s %p: %x\n", mapComponent(ctx, handle), handle, data1);
@@ -767,12 +708,10 @@ OMX_ERRORTYPE splEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
       default:
          genericEventHandler(handle, ctx, event, data1, data2, eventdata);
    }
-   pthread_mutex_unlock(&ctx->cmpFlagLock);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE vidEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
-   pthread_mutex_lock(&ctx->cmpFlagLock);
    switch (event) {
       case OMX_EventError:
          fprintf(stderr, "ERROR:%s %p: %x\n", mapComponent(ctx, handle), handle, data1);
@@ -786,7 +725,6 @@ OMX_ERRORTYPE vidEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
       default:
          genericEventHandler(handle, ctx, event, data1, data2, eventdata);
    }
-   pthread_mutex_unlock(&ctx->cmpFlagLock);
    return OMX_ErrorNone;
 }
 
@@ -813,9 +751,7 @@ OMX_ERRORTYPE filled(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADE
    #ifdef DEBUG
       printf("Got a buffer filled event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    #endif
-   pthread_mutex_lock(&ctx->encBufLock);
    ctx->encBufferFilled=1;
-   pthread_mutex_unlock(&ctx->encBufLock);
    return OMX_ErrorNone;
 }
 
@@ -860,11 +796,12 @@ static void *fps(void *p) {
 
    while (ctx.state!=DECEOF) {
       lastframe = ctx.framecount;
-      sleep(1);
+      if (sleep(1)>0) break;
       printf("Frame %6lld (%5.2fs).  Frames last second: %lli     \r",
          ctx.framecount, (float)ctx.framecount/ctx.omxFPS, ctx.framecount-lastframe);
       fflush(stdout);
    }
+   printf("\n");
    return NULL;
 }
 
@@ -891,18 +828,6 @@ static OMX_BUFFERHEADERTYPE *allocbufs(OMX_HANDLETYPE h, int port) {
 
    free(portdef);
    return list;
-}
-
-static int dofiltertest(AVPacket *rp) {
-
-   if (!(rp->buf->data[0] == 0x00 && rp->buf->data[1] == 0x00 && rp->buf->data[2] == 0x00 && rp->buf->data[3] == 0x01)) {
-      printf("h264 input data required to be in annex b format. Use, e.g:\n");
-      printf("\tffmpeg -i INPUT.mp4 -codec copy -bsf:v h264_mp4toannexb OUTPUT.ts\n");
-      printf("to convert before processing.\n");
-      return 1;
-   }
-
-   return 0;
 }
 
 /* Request a component to change state and optionally wait:
@@ -944,9 +869,7 @@ static void waitForEvents(OMX_HANDLETYPE handle, uint8_t cFlag) {
 }
 
 static void sendCommand(OMX_HANDLETYPE handle, OMX_COMMANDTYPE command, OMX_U32 port, uint8_t cFlag, int wait) {
-   pthread_mutex_lock(&ctx.cmpFlagLock);
    ctx.componentFlags|=cFlag;
-   pthread_mutex_unlock(&ctx.cmpFlagLock);
    OERR(OMX_SendCommand(handle, command, port, NULL));
 
    if (wait>0) waitForEvents(handle, cFlag);
@@ -1335,9 +1258,10 @@ static void configure(struct context *ctx) {
 }
 
 static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
-   OMX_PARAM_PORTDEFINITIONTYPE   *portdef;
-   OMX_VIDEO_PORTDEFINITIONTYPE   *viddef;
-   OMX_BUFFERHEADERTYPE   *decbufs;
+   OMX_PARAM_PORTDEFINITIONTYPE *portdef;
+   OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
+   OMX_BUFFERHEADERTYPE *decbufs;
+   OMX_NALSTREAMFORMATTYPE *nalStreamFormat;
 
    MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
 
@@ -1351,8 +1275,23 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
    viddef->nFrameHeight = ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->height;
    viddef->eCompressionFormat = mapCodec(ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id);
    viddef->bFlagErrorConcealment = 0;
-
    OERR(OMX_SetParameter(ctx->dec, OMX_IndexParamPortDefinition, portdef));
+
+/* TODO! */
+   if (ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id==AV_CODEC_ID_H264) {
+      if (ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->extradata==NULL) ctx->naluInputFormat=1;
+      else if (ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->extradata_size<7) ctx->naluInputFormat=1;
+      else if (*(ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->extradata)!=1) ctx->naluInputFormat=1; // omxplayer: valid avcC atom data always starts with the value 1 (version), otherwise annexb
+      else ctx->naluInputFormat=0;
+      if (ctx->naluInputFormat==1) {
+         printf("** h264 annexb format detected\n");
+         MAKEME(nalStreamFormat, OMX_NALSTREAMFORMATTYPE);
+
+         nalStreamFormat->nPortIndex = PORT_DEC;
+         nalStreamFormat->eNaluFormat = OMX_NaluFormatStartCodes;
+         OERR(OMX_SetParameter(ctx->dec, OMX_IndexParamNalStreamFormatSelect, nalStreamFormat));
+      }
+   }
 
    /* Allocate the input buffers: port needs to be in idle state, and disabled.
     * Note that it doesn't actually enable until after all buffers allocated, so
@@ -1669,53 +1608,73 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
  *    are sps followed by pps. These must be known before the output file can be opened.
  */
 static void emptyEncoderBuffers(struct context *ctx) {
-   int nalType;
+   int nalType=-1;
    size_t curNalSize;
    int i;
 
-   pthread_mutex_lock(&ctx->encBufLock);
-   i=ctx->encBufferFilled;
-   pthread_mutex_unlock(&ctx->encBufLock);
-   if (i==0) {
+   if (ctx->encBufferFilled==0) {
       ctx->encWaitTime++;
       return;  /* Buffer is empty - return to main loop */
    }
-   if (ctx->encbufs->nFlags & OMX_BUFFERFLAG_EOS) {
-      ctx->state=ENCEOS;
-      return;
-   }
 
    if (ctx->userFlags & UFLAGS_RAW) {
-      write(ctx->raw_fd, &ctx->encbufs->pBuffer[ctx->encbufs->nOffset], ctx->encbufs->nFilledLen);
+      write(ctx->raw_fd, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
    }
    else {
-      curNalSize=ctx->nalEntry.nalBufOffset+ctx->encbufs->nFilledLen;
-      if (curNalSize>ctx->nalEntry.nalBufSize) {
-         fprintf(stderr, "\nERROR: nalBufSize exceeded.\n");
-         exit(1);
-      }
-      memcpy(ctx->nalEntry.nalBuf + ctx->nalEntry.nalBufOffset, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
-      ctx->nalEntry.nalBufOffset=curNalSize;
-      ctx->nalEntry.pts=((((int64_t) ctx->encbufs->nTimeStamp.nHighPart)<<32) | ctx->encbufs->nTimeStamp.nLowPart);
-
-      if (ctx->encbufs->nFlags & OMX_BUFFERFLAG_ENDOFNAL) { /* At end of nal */
-         nalType=examineNAL(ctx);
-
-         if (ctx->state==OPENOUTPUT) {
-            if (openOutput(ctx, nalType)==0) /* returns 0 if both sps and pps are known */
-               ctx->state = RUNNING;
+      if (ctx->state==OPENOUTPUT && (ctx->encbufs->nFlags & OMX_BUFFERFLAG_CODECCONFIG)) {
+         printf("Examining extradata...\n");
+         /* This code was copied from ffmpeg */
+         if (av_reallocp(&ctx->oc->streams[0]->codecpar->extradata, ctx->oc->streams[0]->codecpar->extradata_size + ctx->encbufs->nFilledLen + AV_INPUT_BUFFER_PADDING_SIZE) == 0) {
+            memcpy(ctx->oc->streams[0]->codecpar->extradata + ctx->oc->streams[0]->codecpar->extradata_size, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
+            ctx->oc->streams[0]->codecpar->extradata_size += ctx->encbufs->nFilledLen;
+            memset(ctx->oc->streams[0]->codecpar->extradata + ctx->oc->streams[0]->codecpar->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE); /* Add extra zeroed bytes to prevent certain optimised readers from reading past the end */
          }
-         else /* Output file is open */
-            writeVideoPacket(ctx, nalType);
-         ctx->nalEntry.nalBufOffset = 0;  /* Flag that the buffer is empty */
+         else  {
+            fprintf(stderr, "\nERROR: Failed to allocate memory for extradata.\n");
+            exit(1);
+         }
+         int nals[32] = { 0 };   /* Check that we have both sps and pps in extradata: newer versions of rpi libs put both in one buffer, older versions used separate buffers */
+         for (i = 0; i + 4 < ctx->oc->streams[0]->codecpar->extradata_size; i++) {
+             if (!ctx->oc->streams[0]->codecpar->extradata[i + 0] &&
+                 !ctx->oc->streams[0]->codecpar->extradata[i + 1] &&
+                 !ctx->oc->streams[0]->codecpar->extradata[i + 2] &&
+                 ctx->oc->streams[0]->codecpar->extradata[i + 3] == 1) {
+                 nals[ctx->oc->streams[0]->codecpar->extradata[i + 4] & 0x1f]++;
+             }
+         }
+         if (nals[7] && nals[8]) {
+            openOutput(ctx);
+            ctx->state = RUNNING;
+         }
+      }
+      else {
+         curNalSize=ctx->nalEntry.nalBufOffset+ctx->encbufs->nFilledLen;
+         if (curNalSize>ctx->nalEntry.nalBufSize) {
+            fprintf(stderr, "\nERROR: nalBufSize exceeded.\n");
+            exit(1);
+         }
+         memcpy(ctx->nalEntry.nalBuf + ctx->nalEntry.nalBufOffset, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
+         ctx->nalEntry.nalBufOffset=curNalSize;
+         ctx->nalEntry.pts=((((int64_t) ctx->encbufs->nTimeStamp.nHighPart)<<32) | ctx->encbufs->nTimeStamp.nLowPart);
+
+         if (ctx->encbufs->nFlags & OMX_BUFFERFLAG_ENDOFNAL) { /* At end of nal */
+            nalType=examineNAL(ctx);
+            if (ctx->state == RUNNING) writeVideoPacket(ctx, nalType);
+            else if (ctx->state==OPENOUTPUT && nalType==5) {
+               fprintf(stderr, "\nERROR: sps or pps or both missing from encoder stream.\n");
+               exit(1);
+            }
+            ctx->nalEntry.nalBufOffset = 0;
+         }
       }
    }
-   pthread_mutex_lock(&ctx->encBufLock); /* Lock not really required as we haven't called OMX_FillThisBuffer() yet and only one buffer, but just in case */
-   ctx->encBufferFilled=0;
-   pthread_mutex_unlock(&ctx->encBufLock);
+   ctx->encBufferFilled=0;                /* Flag that the buffer is empty */
    ctx->encbufs->nFilledLen = 0;
    ctx->encbufs->nOffset = 0;
-   OERR(OMX_FillThisBuffer(ctx->enc, ctx->encbufs)); /* Finished processing buffer - request buffer refill */
+   if (ctx->encbufs->nFlags & OMX_BUFFERFLAG_EOS) /* This is the last buffer */
+      ctx->state=ENCEOS;
+   else
+      OERR(OMX_FillThisBuffer(ctx->enc, ctx->encbufs)); /* Finished processing buffer - request buffer refill */
 }
 
 static void *sigHandler_thread(void *arg) {
@@ -1733,17 +1692,73 @@ static void *sigHandler_thread(void *arg) {
    return NULL;
 }
 
-int main(int argc, char *argv[]) {
-   int i, j;
-   time_t start, end;
+OMX_BUFFERHEADERTYPE *getSpareDecBuffer(struct context *ctx) {
+   OMX_BUFFERHEADERTYPE *spare;
+
+   do {
+      emptyEncoderBuffers(ctx); /* Empty filled encoder buffers as required */
+      spare = ctx->decbufs;
+      while (spare!=NULL && spare->nFilledLen != 0) /* Find a free buffer (indicated by nFilledLen == 0); if spare==NULL all buffers are used (pAppPrivate of last buffer is NULL) */
+         spare = spare->pAppPrivate;
+      usleep(10);
+   } while (spare==NULL);
+   return spare;
+}
+
+void fillDecBuffers(struct context *ctx, int i, AVPacket *p) {
    int offset;
-   AVPacket *p=NULL, *rp=NULL;
-   int AV_videoCodecID;
-   int filtertest;
    int size, nsize;
    OMX_BUFFERHEADERTYPE *spare;
    OMX_TICKS tick;
    int64_t omt;
+
+   /* From ffmpeg docs: pkt->pts can be AV_NOPTS_VALUE (-9223372036854775808) if the video format has B-frames, so it is better to rely on pkt->dts if you do not decompress the payload */
+   switch (ctx->ptsOpt) {
+      case 0: ctx->videoPTS=p->pts; break; /* Use packet pts */
+      case 1: ctx->videoPTS=p->dts; break; /* Use packet dts */
+      case 2: ctx->videoPTS+=p->duration; break; /* Use packet duration */
+      default: ctx->videoPTS+=p->duration; break;
+   }
+   omt = av_rescale_q(ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base, ctx->omxtimebase); /* Transform input timebase to omx timebase */
+   //fprintf(stderr,"Input pts: %lld; timebase: %i/%i\n", ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.num, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.den);
+   tick.nLowPart = (uint32_t) (omt & 0xffffffff);
+   tick.nHighPart = (uint32_t) ((omt & 0xffffffff00000000) >> 32);
+
+   size = p->buf->size;
+   ctx->framecount++;
+   offset = 0;
+   while (size>0) {
+      spare=getSpareDecBuffer(ctx);
+      spare->nFlags = i == 0 ? OMX_BUFFERFLAG_STARTTIME : 0; /* If it is first frame set start time flag, otherwise clear flags */
+
+      /* Fill the decoder buffer */
+      if (size > spare->nAllocLen)  /* Frame is too big for one buffer */
+         nsize = spare->nAllocLen;
+      else {
+         nsize = size;     /* Frame will fit in buffer */
+         spare->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
+      }
+      memcpy(spare->pBuffer, p->buf->data+offset, nsize);
+
+      if (p->flags & AV_PKT_FLAG_KEY)
+         spare->nFlags |= OMX_BUFFERFLAG_SYNCFRAME;
+
+      spare->nTimeStamp = tick;
+      pthread_mutex_lock(&ctx->decBufLock);
+      spare->nFilledLen = nsize;
+      pthread_mutex_unlock(&ctx->decBufLock);
+      spare->nOffset = 0;
+      OERR(OMX_EmptyThisBuffer(ctx->dec, spare));
+      size -= nsize;
+      offset += nsize;
+   }
+}
+
+int main(int argc, char *argv[]) {
+   int i, j;
+   time_t start, end;
+   AVPacket *p=NULL;
+   OMX_BUFFERHEADERTYPE *spare;
    pthread_t fpst;
    pthread_attr_t fpsa;
    sigset_t set;
@@ -1752,10 +1767,6 @@ int main(int argc, char *argv[]) {
    setupUserOpts(&ctx, argc, argv);
    ctx.omxtimebase.num=1;
    ctx.omxtimebase.den=1000000; /* OMX timebase is in micro seconds */
-   ctx.nalEntry.sps=NULL;
-   ctx.nalEntry.pps=NULL;
-   ctx.nalEntry.spsSize=0;
-   ctx.nalEntry.ppsSize=0;
    ctx.nalEntry.nalBufSize=1024*1024*2; /* 2MB buffer */
    ctx.nalEntry.nalBuf=av_malloc(ctx.nalEntry.nalBufSize);
    if (ctx.nalEntry.nalBuf==NULL) {
@@ -1767,6 +1778,7 @@ int main(int argc, char *argv[]) {
    ctx.componentFlags=0;
    ctx.componentFlags=0;
    ctx.encBufferFilled=0;
+   ctx.naluInputFormat=0;
 
    TAILQ_INIT(&packetq);
 
@@ -1784,8 +1796,6 @@ int main(int argc, char *argv[]) {
    }
 
    i=pthread_mutex_init(&ctx.decBufLock, NULL);
-   i+=pthread_mutex_init(&ctx.encBufLock, NULL);
-   i+=pthread_mutex_init(&ctx.cmpFlagLock, NULL);
    if (i!=0) {
       fprintf(stderr,"mutex init failed; exit.\n");
       exit(1);
@@ -1801,10 +1811,22 @@ int main(int argc, char *argv[]) {
    OERR(OMX_GetHandle(&ctx.spl, SPLNAME, &ctx, &splEventCallback));
    OERR(OMX_GetHandle(&ctx.vid, VIDNAME, &ctx, &vidEventCallback));
 
-   AV_videoCodecID=openInputFile(&ctx);
+   openInputFile(&ctx);
    ctx.decbufs=configDecoder(&ctx);
-   
-   filtertest = (AV_videoCodecID==AV_CODEC_ID_H264); /* Check for annex b input stream */
+   /* If there is extradata send it to the decoder to have a look at */
+   if (ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata!=NULL
+         && ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size>0) {
+      printf("** Found extradata in video stream...\n");
+      spare=ctx.decbufs;
+      if (ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size < spare->nAllocLen) {
+         spare->nFilledLen=ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size;
+         memcpy(spare->pBuffer, ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata, spare->nFilledLen);
+         spare->nFlags=OMX_BUFFERFLAG_CODECCONFIG | OMX_BUFFERFLAG_ENDOFFRAME;
+         OERR(OMX_EmptyThisBuffer(ctx.dec, spare));
+      }
+      else
+         fprintf(stderr,"WARNING: extradata too big for input buffer - ignoring...\n");
+   }
 
    ctx.audioPTS=ctx.ic->streams[ctx.inVidStreamIdx]->start_time;
    ctx.videoPTS=ctx.ic->streams[ctx.inVidStreamIdx]->start_time;
@@ -1824,109 +1846,68 @@ int main(int argc, char *argv[]) {
       break;
    }
 
-   for (i = j = 0; ctx.state != ENCEOS; i++, j++) {
-      if (ctx.state!=DECEOF) {
-         if (ctx.state!=QUIT)
-            rp = getNextVideoPacket(&ctx);
-         if (rp == NULL) {         /* If end of file, keep sending zeroed out packets until EOS on encoder */
-            ctx.state = DECEOF;
-            avformat_close_input(&ctx.ic);
-            if (av_buffer_is_writable(p->buf)==1)
-               memset(p->buf->data, 0, p->buf->size); /* Clear packet data; send OMX_BUFFERFLAG_EOS with this empty packet (below) */
-            else
-               fprintf(stderr, "Can't zero last packet buffer for flush!\n");
-         }
-         else {
-            av_packet_free(&p); /* Free previous packet from decoder */
-            p = rp;
-            rp=NULL; /* Ref is passed to p */
-            if (filtertest) { /* If input is h264, expecting annex B */
-               filtertest = 0; // Don't do this next time round
-               if(dofiltertest(p)==1) exit(1);
-            }
-            
-            /* From ffmpeg docs: pkt->pts can be AV_NOPTS_VALUE (-9223372036854775808) if the video format has B-frames, so it is better to rely on pkt->dts if you do not decompress the payload */
-            switch (ctx.ptsOpt) {
-               case 0: ctx.videoPTS=p->pts; break; /* Use packet pts */
-               case 1: ctx.videoPTS=p->dts; break; /* Use packet dts */
-               case 2: ctx.videoPTS+=p->duration; break; /* Use packet duration */
-               default: ctx.videoPTS+=p->duration; break;
-            }
-            omt = av_rescale_q(ctx.videoPTS, ctx.ic->streams[ctx.inVidStreamIdx]->time_base, ctx.omxtimebase); /* Transform input timebase to omx timebase */
-            //fprintf(stderr,"Input pts: %lld; timebase: %i/%i\n", ctx.videoPTS, ctx.ic->streams[ctx.inVidStreamIdx]->time_base.num, ctx.ic->streams[ctx.inVidStreamIdx]->time_base.den);
-         }
+   /* Feed the decoder frames until the parameters are identified and port 131 changes state */
+   for (j=0; ctx.state!=TUNNELSETUP; j++) {
+      p=getNextVideoPacket(&ctx);
+      if (p!=NULL) {
+         fillDecBuffers(&ctx,j,p);
+         av_packet_free(&p);
       }
-
-/* Encoder setup when stream identified, indicated by a state change on port 131, then configure() sets up pipelines */
-      switch (ctx.state) {
+      else
+         ctx.state = DECEOF;
+      if (j==120)
+         ctx.state=DECFAILED;
+   }
+   switch (ctx.state) {
+      case DECFAILED:
+         fprintf(stderr, "ERROR: Failed to set the parameters after %d video frames.  Giving up.\n", j);
+         exit(1);
+         break;
+      case DECEOF:
+         fprintf(stderr, "ERROR: End of file before parameters could be set.\n");
+         exit(1);
+         break;
       case TUNNELSETUP:
-         printf("Identified the parameters after %d video frames.\n", i);
+         printf("Identified the parameters after %d video frames.\n", j);
          start = time(NULL);
          configure(&ctx);
          pthread_attr_init(&fpsa);
          pthread_attr_setdetachstate(&fpsa, PTHREAD_CREATE_DETACHED);
          pthread_create(&fpst, &fpsa, fps, NULL); /* Run fps calculator in another thread */
          break;
-      case DECINIT:
-         if (i < 120) /* Keep going if number of frames < 120; otherwise bail; port 131 has not changed state; decoder doesn't like it */
-            break;
-         ctx.state = DECFAILED;
-         /* Drop through */
-      case DECFAILED:
-         fprintf(stderr, "Failed to set the parameters after %d video frames.  Giving up.\n", i);
+      case QUIT:
          exit(1);
-         break;
       default:
-         break;   /* Shuts the compiler up */
-      }
-
-      tick.nLowPart = (uint32_t) (omt & 0xffffffff);
-      tick.nHighPart = (uint32_t) ((omt & 0xffffffff00000000) >> 32);
-
-      size = p->buf->size;
-      ctx.framecount++;
-      offset = 0;
-      while (size>0) {
-         do {
-            emptyEncoderBuffers(&ctx);
-            spare = ctx.decbufs;
-            while (spare!=NULL && spare->nFilledLen != 0) /* Find a free buffer (indicated by nFilledLen == 0); if spare==NULL all buffers are used (pAppPrivate of last buffer is NULL) */
-               spare = spare->pAppPrivate;
-            usleep(10);
-         } while (spare==NULL);
-
-         if (ctx.state == ENCEOS) /* Got EOS at encoder output: finished! */
-            break;
-         spare->nFlags = i == 0 ? OMX_BUFFERFLAG_STARTTIME : 0; /* If it is first frame set start time flag, otherwise clear flags */
-         /* Fill the decoder buffer */
-         if (size > spare->nAllocLen)  /* Frame is too big for one buffer */
-            nsize = spare->nAllocLen;
-         else {
-            nsize = size;     /* Frame will fit in buffer */
-            spare->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
-         }
-         memcpy(spare->pBuffer, p->buf->data+offset, nsize);
-
-         if (p->flags & AV_PKT_FLAG_KEY)
-            spare->nFlags |= OMX_BUFFERFLAG_SYNCFRAME;
-         if (ctx.state==DECEOF)
-             spare->nFlags|=OMX_BUFFERFLAG_EOS;
-         spare->nTimeStamp = tick;
-         pthread_mutex_lock(&ctx.decBufLock);
-         spare->nFilledLen = nsize;
-         pthread_mutex_unlock(&ctx.decBufLock);
-         spare->nOffset = 0;
-         OERR(OMX_EmptyThisBuffer(ctx.dec, spare));
-         size -= nsize;
-         offset += nsize;
-      }
+         fprintf(stderr, "ERROR: System in an unexpected state: %i.\n",ctx.state);
+         exit(1);
+   }
+   
+   /* Main loop */
+   for (i = j+1; ctx.state != QUIT; i++) {
+      p = getNextVideoPacket(&ctx);
+      if (p == NULL) break;
+      fillDecBuffers(&ctx,i,p);
+      av_packet_free(&p);
    } /* End of main loop */
 
-   av_packet_free(&p);
+   ctx.state = DECEOF;  /* Signal fps thread to finish */
+   avformat_close_input(&ctx.ic);
+   spare=getSpareDecBuffer(&ctx);
+   spare->nFilledLen=0;
+   spare->nOffset = 0;
+   spare->nFlags=OMX_BUFFERFLAG_ENDOFFRAME | OMX_BUFFERFLAG_EOS | OMX_BUFFERFLAG_TIME_UNKNOWN;
+   OERR(OMX_EmptyThisBuffer(ctx.dec, spare));
+
+   /* Wait for encoder to finish processing */
+   while (ctx.state != ENCEOS) {
+      emptyEncoderBuffers(&ctx);
+      usleep(10);
+   }
+   
    end = time(NULL);
 
    printf("\nProcessed %lli frames in %d seconds; %llif/s\n\n\n", ctx.framecount, end-start, (ctx.framecount/(end-start)));
-   printf("Number of wasted encoder cycles: %lli\n",ctx.encWaitTime);
+   printf("Time waiting for encoder to finish: %.2lfs\n",(double)ctx.encWaitTime*1E-5);
    
    if (ctx.oc) {
       av_write_trailer(ctx.oc);
@@ -1937,7 +1918,5 @@ int main(int argc, char *argv[]) {
 
    av_free(ctx.nalEntry.nalBuf);
    pthread_mutex_destroy(&ctx.decBufLock);
-   pthread_mutex_destroy(&ctx.encBufLock);
-   pthread_mutex_destroy(&ctx.cmpFlagLock);
    return 0;
 }

@@ -1,0 +1,12 @@
+Previous: omxtx.13.c
+
+02-09-2016: Fix warnings with ffmpeg version 3.1.3: use codecpar - minimum set initialised, probably needs more work. NOTE that if you initialise the stream with a codec (as previously done) the new codecpar stuff seems to be ignored. Remove h264 annex B filter as this has been depreciated in ffmpeg, but can't find any replacement.
+
+15-11-2016: Preliminary support for vp8. Problem with vorbis audio in webm. However vp8->x264 seems to work. Requires:
+            start_file=start_x.elf
+            fixup_file=fixup_x.dat
+            in /boot/config.txt
+16-11-2016: Problem with vorbis audio appeared to be frame size: this requires extra data to calculate. Sure enough, extradata is filled in in codecpar for vorbis input streams. If present on the audio input stream, copy extradata to the audio output stream. Works now!
+15-01-2017: Changed main loop, added in extradata handeling for h264 input streams, added in OMX_IndexParamNalStreamFormat stuff.
+22-01-2017: After update of firmware to raspberrypi-firmware 20170114-1 (arch linux), sps and pps are now output together in a single buffer at the start; previously they appeared in separate buffers. Fix this by using OMX_BUFFERFLAG_CODECCONFIG test similar to ffmpeg omx code.
+            Use _Atomic variables in OMX callbacks instead of mutex. However, decoder still uses mutex locking: the way the buffers are set up means that it depends on a structure defined in OMX headers. To use atomic variables, the buffer allocation would need to be changed, e.g. use an array of pointers to the buffers instead. Then an atomic int variable could be used to indicate a free buffer by passing back the index.

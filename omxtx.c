@@ -37,11 +37,10 @@
 
 /* NOTES: rpi is 32 bit: int and long, int32 are all 4 byte, long long and int64 are 8 byte
  *
- *        If the muxer produces errors anout non-monotonically increasing pts /dts, try using
- *        the option -p to change how pts is derived.  The default is to base the pts on the
- *        duration stored in the input packets; I have found this the most reliable. Note that
- *        Some streams appear to reset the input pts to zero after the start credits: the muxer
- *        doesn't like this!
+ *        The output tick from the encoder is sometimes not correct. This version
+ *        uses the input duration to generate timestamps for the output pts, by assuming
+ *        each output frame corresponds to an input frame. Assumes constant framerates and
+ *        that no frames will be dropped.
  *
  *        ffmpeg docs: https://www.ffmpeg.org/documentation.html
  */
@@ -153,7 +152,9 @@ typedef struct {
    uint8_t *nalBuf;
    uint32_t nalBufSize; /* 32 bit: maximum buffer size 4GB! */
    off_t nalBufOffset;
+   int64_t tick;
    int64_t pts;
+   int64_t pre_pts;
 } OMXTX_NAL_ENTRY;
 
 static struct context {
@@ -162,7 +163,9 @@ static struct context {
    OMXTX_NAL_ENTRY nalEntry;  /* Store for NAL header info */
    int      raw_fd;        /* File descriptor for raw output file */
    uint16_t userFlags;      /* User command line switch flags */
-   volatile _Atomic uint64_t framecount;
+   uint64_t framesIn;
+   volatile _Atomic uint64_t framesOut;
+   volatile _Atomic uint64_t ptsDelta; /* Time difference in ms between output pts and omx tick */
    volatile _Atomic uint8_t componentFlags;
    volatile _Atomic int encBufferFilled;
    volatile _Atomic enum states state;
@@ -172,17 +175,17 @@ static struct context {
    int      inVidStreamIdx;
    int      inAudioStreamIdx; /* <0 if there is no audio stream */
    int      userAudioStreamIdx;
-   int      ptsOpt;
    int64_t  audioPTS;
    int64_t  videoPTS;
+   int64_t  omxDuration;   /* Assumed output frame duration based on input frame duration, in omx time base */
    OMX_HANDLETYPE   dec, enc, rsz, dei, spl, vid;
    pthread_mutex_t decBufLock;
    AVBitStreamFilterContext *bsfc;
    int   bitrate;
-   float omxFPS;
+   double omxFPS;
    char  *iname;
    char  *oname;
-   AVRational omxtimebase;
+   AVRational omxtimebase; /* OMX time base is micro seconds */
    OMX_CONFIG_RECTTYPE *cropRect;
    int outputWidth;
    int outputHeight;
@@ -199,6 +202,7 @@ static struct context {
 #define UFLAGS_CROP          (uint16_t)(1U<<6)
 #define UFLAGS_AUTO_SCALE_X  (uint16_t)(1U<<7)
 #define UFLAGS_AUTO_SCALE_Y  (uint16_t)(1U<<8)
+#define UFLAGS_USE_OMX_TICK  (uint16_t)(1U<<9)
 
 /* Component flags */
 #define CFLAGS_RSZ       (uint8_t)(1U<<0)
@@ -366,7 +370,7 @@ static void cleanup(struct context *ctx) {
 static void exitHandler(void) {
    enum OMX_STATETYPE state;
 
-   printf("\n\nIn exit handler, after %lli frames:\n", ctx.framecount);
+   printf("\n\nIn exit handler, after %lli frames:\n", ctx.framesOut);
    if (ctx.userFlags & UFLAGS_VERBOSE) {
       dumpport(ctx.dec, PORT_DEC);
       dumpport(ctx.enc, PORT_ENC+1);
@@ -488,11 +492,11 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
    oflow->codecpar->profile = FF_PROFILE_H264_HIGH;
    oflow->codecpar->level = 41;   /* The profile level: hard coded here to 4.1 */
 
-   oflow->time_base = iflow->time_base;               /* Set timebase hint for muxer: will be overwritten on header write depending on container format */
+   oflow->time_base = ctx.omxtimebase;               /* Set timebase hint for muxer: will be overwritten on header write depending on container format */
    oflow->codecpar->format = AV_PIX_FMT_YUV420P; // TODO: should match up with OMX formats!
    oflow->avg_frame_rate = iflow->avg_frame_rate; /* Set framerate of output stream */
    oflow->r_frame_rate = iflow->r_frame_rate;
-   oflow->start_time=iflow->start_time;
+   oflow->start_time=0;
 
    if ((ctx.userFlags & UFLAGS_RESIZE)==0) { /* If resizing use default 1:1 pixel aspect, otherwise copy apect ratio from input */
       oflow->codecpar->sample_aspect_ratio.num = iflow->codecpar->sample_aspect_ratio.num;
@@ -500,8 +504,6 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       oflow->sample_aspect_ratio.num = iflow->codecpar->sample_aspect_ratio.num;
       oflow->sample_aspect_ratio.den = iflow->codecpar->sample_aspect_ratio.den;
    }
-   //if (oc->oformat->flags & AVFMT_GLOBALHEADER)
-   //   oflow->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
    printf("\n\n\n");
    if (ctx.inAudioStreamIdx>0) {
@@ -509,27 +511,11 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       printf("*** Mapping input audio stream #%i to output audio stream #%i ***\n\n", ctx.inAudioStreamIdx, 1);
       iflow = ic->streams[ctx.inAudioStreamIdx];
       oflow = avformat_new_stream(oc, NULL); /* Stream 1 */
-      oflow->codecpar->codec_type = iflow->codecpar->codec_type;
-      
-      oflow->codecpar->codec_id = iflow->codecpar->codec_id;
-      oflow->codecpar->codec_tag = iflow->codecpar->codec_tag;
-      oflow->codecpar->format = iflow->codecpar->format;
-      oflow->codecpar->bit_rate = iflow->codecpar->bit_rate;
-      oflow->codecpar->bits_per_coded_sample = iflow->codecpar->bits_per_coded_sample;
-      oflow->codecpar->bits_per_raw_sample = iflow->codecpar->bits_per_raw_sample;
-      oflow->codecpar->channel_layout = iflow->codecpar->channel_layout;
-      oflow->codecpar->channels = iflow->codecpar->channels;
-      oflow->codecpar->sample_rate = iflow->codecpar->sample_rate;
-      oflow->codecpar->block_align = iflow->codecpar->block_align;
-      oflow->codecpar->frame_size = iflow->codecpar->frame_size;
-      oflow->codecpar->initial_padding = iflow->codecpar->initial_padding;
-      oflow->codecpar->trailing_padding = iflow->codecpar->trailing_padding;
-      oflow->codecpar->seek_preroll = iflow->codecpar->seek_preroll;
+      if (avcodec_parameters_copy(oflow->codecpar, iflow->codecpar) < 0) /* This copies extradata */
+         fprintf(stderr,"ERROR: Copying parameters for audio stream failed.\n");
+      oflow->codecpar->codec_tag=0; /* Don't copy FOURCC: Causes problems when remuxing */
+      oflow->start_time=0;
       oflow->time_base = iflow->time_base; /* Time base hint */
-      oflow->start_time=iflow->start_time;
-
-      //if (oc->oformat->flags & AVFMT_GLOBALHEADER)
-      //   oflow->codecpar->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
    }
 
    printf("Input:\n");
@@ -542,19 +528,19 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
 
 static void writeAudioPacket(AVPacket *pkt) {
    int ret;
-
    pkt->stream_index=1;
+   
+   if (ctx.userFlags & UFLAGS_USE_OMX_TICK && pkt->dts > ctx.audioPTS)
+      ctx.audioPTS=pkt->dts;
+   else
+      ctx.audioPTS+=pkt->duration; /* Use packet duration */
 
-   switch (ctx.ptsOpt) {
-      case 0: ctx.audioPTS=pkt->pts; break; /* Use packet pts */
-      case 1: ctx.audioPTS=pkt->pts; break; /* Use packet pts: dts not used for audio */
-      case 2: ctx.audioPTS+=pkt->duration; break; /* Use packet duration */
-      default: ctx.audioPTS+=pkt->duration; break;
-   }
-   pkt->pts = av_rescale_q_rnd(ctx.audioPTS,
+   pkt->duration = av_rescale_q(pkt->duration,
               ctx.ic->streams[ctx.inAudioStreamIdx]->time_base,
-              ctx.oc->streams[1]->time_base,
-              AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+              ctx.oc->streams[1]->time_base);
+   pkt->pts = av_rescale_q(ctx.audioPTS,
+              ctx.ic->streams[ctx.inAudioStreamIdx]->time_base,
+              ctx.oc->streams[1]->time_base);
    pkt->dts=pkt->pts; /* Audio packet: dts=pts */
 
    // fprintf(stderr,"Audio PTS %lld\n", pkt->pts);
@@ -570,6 +556,7 @@ static int openOutput(struct context *ctx) {
 
    printf("Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
 
+#ifdef OLD_CODE /* Extra data is now copied by avcodec_parameters_copy() in makeOutputContext() */
    if (ctx->inAudioStreamIdx>0) {
       if (ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata) {
          printf(" Found extradata in audio stream: WIP!\n");
@@ -580,7 +567,7 @@ static int openOutput(struct context *ctx) {
          }
       }
    }
-
+#endif
    if (!(ctx->oc->oformat->flags & AVFMT_NOFILE)) {
      ret = avio_open(&ctx->oc->pb, ctx->oname, AVIO_FLAG_WRITE);
      if (ret < 0) {
@@ -795,10 +782,10 @@ static void *fps(void *p) {
    uint64_t lastframe;
 
    while (ctx.state!=DECEOF) {
-      lastframe = ctx.framecount;
+      lastframe = ctx.framesOut;
       if (sleep(1)>0) break;
-      printf("Frame %6lld (%5.2fs).  Frames last second: %lli     \r",
-         ctx.framecount, (float)ctx.framecount/ctx.omxFPS, ctx.framecount-lastframe);
+      printf("Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims     \r",
+         ctx.framesOut, (double)ctx.framesOut/ctx.omxFPS, ctx.framesOut-lastframe, ctx.ptsDelta);
       fflush(stdout);
    }
    printf("\n");
@@ -1046,7 +1033,7 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureMonitor(struct context *ctx, OMX_P
    return portdef; /* Unchanged in this case: outputs are a copy of input */
 }
 
-static void configure(struct context *ctx) {
+static void configure (struct context *ctx) {
    OMX_VIDEO_PARAM_PROFILELEVELTYPE *level;
    OMX_VIDEO_PARAM_BITRATETYPE *bitrate;
    OMX_PARAM_PORTDEFINITIONTYPE *portdef;
@@ -1154,6 +1141,7 @@ static void configure(struct context *ctx) {
       OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmPixelAspectRatio, pixaspect));
    }
 
+
    if (ctx->userFlags & UFLAGS_VERBOSE) {
       MAKEME(level, OMX_VIDEO_PARAM_PROFILELEVELTYPE);
       level->nPortIndex = PORT_ENC+1;
@@ -1253,7 +1241,10 @@ static void configure(struct context *ctx) {
          exit(1);
       }
    }
-   ctx->omxFPS=(float)portdef->format.video.xFramerate/(float)(1<<16);
+
+   /* omxFPS is used to calculate the encoding frame rate - it is not used for timing purposes! */
+   ctx->omxFPS=(double)portdef->format.video.xFramerate/(double)(1<<16); /* WARNING: this may not be accurate! */
+
    ctx->state=OPENOUTPUT;
 }
 
@@ -1322,10 +1313,8 @@ static void usage(const char *name) {
       "   -d    Deinterlace\n"
       "   -i n  Select audio stream n.\n"
       "   -m    Monitor.  Display the decoder's output\n"
-      "   -p n  Select how the timestamps are calculated:\n"
-      "            n=0: use input frame pts\n"
-      "            n=1: use input frame dts\n"
-      "            n=2: use input frame duration (default)\n"
+      "   -p    Use OMX tick for pts, based on input packet dts. Default is to make up pts based\n"
+      "         on the average frame duration calculated during initialisation.\n"
       "   -r s  Resize: 's' is in pixels specified as widthxheight\n"
       "   -v    Verbose\n"
       "\n"
@@ -1460,8 +1449,7 @@ static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
 
    ctx->bitrate = 2*1024*1024;   /* Default: 2Mb/s */
    ctx->userAudioStreamIdx=-1;   /* Default: guess audio stream */
-   ctx->ptsOpt=2;                /* Default: Use duration to determine pts */
-   while ((opt = getopt(argc, argv, "a::b:c:di:mp:r:v")) != -1) {
+   while ((opt = getopt(argc, argv, "a::b:c:di:mpr:v")) != -1) {
       switch (opt) {
       case 'a':
          if (optarg==NULL)
@@ -1491,7 +1479,7 @@ static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
          ctx->userFlags |= UFLAGS_MONITOR;
       break;
       case 'p':
-         ctx->ptsOpt=atoi(optarg);
+         ctx->userFlags |= UFLAGS_USE_OMX_TICK;
       break;
       case 'r':
          if (setOutputSize(ctx,optarg)==0)
@@ -1574,15 +1562,16 @@ static int examineNAL(struct context *ctx) {
 static void writeVideoPacket(struct context *ctx, int nalType) {
    AVPacket pkt;
    int r=-1;
-   
    av_init_packet(&pkt); /* pkt.data is set to NULL here */
    pkt.stream_index = 0;
    pkt.data = ctx->nalEntry.nalBuf;
    pkt.size = ctx->nalEntry.nalBufOffset;
-  //pkt.buf = av_buffer_create(pkt.data, pkt.size, av_buffer_default_free, NULL, 0); // TODO: ctx->nalEntry.nalBuf can't be used here because it gets freed in av_interleaved_write_frame()
-   pkt.pts = av_rescale_q(ctx->nalEntry.pts, ctx->omxtimebase, ctx->oc->streams[0]->time_base); /* Transform omx pts to output timebase */
+   //pkt.buf = av_buffer_create(pkt.data, pkt.size, av_buffer_default_free, NULL, 0); // TODO: ctx->nalEntry.nalBuf can't be used here because it gets freed in av_interleaved_write_frame()
+   //pkt.duration=av_rescale_q(ctx->omxDuration, ctx->omxtimebase, ctx->oc->streams[0]->time_base);
+   pkt.pts=av_rescale_q(ctx->nalEntry.pts, ctx->omxtimebase, ctx->oc->streams[0]->time_base); /* Transform omx pts to output timebase */
    pkt.dts=pkt.pts; /* Out of order b-frames not supported on rpi: so dts=pts */
-   //fprintf(stderr,"pts: pkt:%lld, OMX:%lld\n",pkt.pts, ctx->nalEntry.pts);
+   ctx->ptsDelta=(ctx->nalEntry.pts-ctx->nalEntry.tick)/1000;
+   //printf("pts:%lld, tick:%lld\n", ctx->nalEntry.pts, ctx->nalEntry.tick);
 
    if (nalType==5)   /* This is an IDR frame */
       pkt.flags |= AV_PKT_FLAG_KEY;
@@ -1593,6 +1582,7 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
       av_strerror(r, err, sizeof(err));
       fprintf(stderr,"\nFailed to write a video frame: %s (pts: %lld; nal: %i)\n", err, ctx->nalEntry.pts, nalType);
    }
+   else ctx->framesOut++;
 }
 
 /* The h264 video data is organized into NAL units (annex b), each of which is effectively a packet
@@ -1655,8 +1645,13 @@ static void emptyEncoderBuffers(struct context *ctx) {
          }
          memcpy(ctx->nalEntry.nalBuf + ctx->nalEntry.nalBufOffset, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
          ctx->nalEntry.nalBufOffset=curNalSize;
-         ctx->nalEntry.pts=((((int64_t) ctx->encbufs->nTimeStamp.nHighPart)<<32) | ctx->encbufs->nTimeStamp.nLowPart);
-
+         ctx->nalEntry.tick=((((int64_t) ctx->encbufs->nTimeStamp.nHighPart)<<32) | ctx->encbufs->nTimeStamp.nLowPart);
+         
+         if ((ctx->userFlags & UFLAGS_USE_OMX_TICK) && ctx->nalEntry.tick>ctx->nalEntry.pts) /* Check that the tick will increase the current pts */
+            ctx->nalEntry.pts=ctx->nalEntry.tick;
+         else
+            ctx->nalEntry.pts+=ctx->omxDuration; /* This is based on the input frame duration */
+         
          if (ctx->encbufs->nFlags & OMX_BUFFERFLAG_ENDOFNAL) { /* At end of nal */
             nalType=examineNAL(ctx);
             if (ctx->state == RUNNING) writeVideoPacket(ctx, nalType);
@@ -1666,6 +1661,7 @@ static void emptyEncoderBuffers(struct context *ctx) {
             }
             ctx->nalEntry.nalBufOffset = 0;
          }
+         else fprintf(stderr, "Warning: End of NAL not found!\n");
       }
    }
    ctx->encBufferFilled=0;                /* Flag that the buffer is empty */
@@ -1710,26 +1706,26 @@ void fillDecBuffers(struct context *ctx, int i, AVPacket *p) {
    int size, nsize;
    OMX_BUFFERHEADERTYPE *spare;
    OMX_TICKS tick;
-   int64_t omt;
+   int64_t omxTicks;
 
    /* From ffmpeg docs: pkt->pts can be AV_NOPTS_VALUE (-9223372036854775808) if the video format has B-frames, so it is better to rely on pkt->dts if you do not decompress the payload */
-   switch (ctx->ptsOpt) {
-      case 0: ctx->videoPTS=p->pts; break; /* Use packet pts */
-      case 1: ctx->videoPTS=p->dts; break; /* Use packet dts */
-      case 2: ctx->videoPTS+=p->duration; break; /* Use packet duration */
-      default: ctx->videoPTS+=p->duration; break;
-   }
-   omt = av_rescale_q(ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base, ctx->omxtimebase); /* Transform input timebase to omx timebase */
+   if ((ctx->userFlags & UFLAGS_USE_OMX_TICK) && p->dts != AV_NOPTS_VALUE)
+      ctx->videoPTS=p->dts;
+   else
+      ctx->videoPTS+=p->duration; /* Use packet duration */
+
+   omxTicks=av_rescale_q(ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base, ctx->omxtimebase); /* Transform input timebase to omx timebase */
+
    //fprintf(stderr,"Input pts: %lld; timebase: %i/%i\n", ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.num, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.den);
-   tick.nLowPart = (uint32_t) (omt & 0xffffffff);
-   tick.nHighPart = (uint32_t) ((omt & 0xffffffff00000000) >> 32);
+   tick.nLowPart = (uint32_t) (omxTicks & 0xffffffff);
+   tick.nHighPart = (uint32_t) ((omxTicks & 0xffffffff00000000) >> 32);
 
    size = p->buf->size;
-   ctx->framecount++;
    offset = 0;
    while (size>0) {
       spare=getSpareDecBuffer(ctx);
-      spare->nFlags = i == 0 ? OMX_BUFFERFLAG_STARTTIME : 0; /* If it is first frame set start time flag, otherwise clear flags */
+      if (i==0) spare->nFlags=OMX_BUFFERFLAG_STARTTIME;
+      else spare->nFlags=0;
 
       /* Fill the decoder buffer */
       if (size > spare->nAllocLen)  /* Frame is too big for one buffer */
@@ -1752,6 +1748,7 @@ void fillDecBuffers(struct context *ctx, int i, AVPacket *p) {
       size -= nsize;
       offset += nsize;
    }
+   ctx->framesIn++;
 }
 
 int main(int argc, char *argv[]) {
@@ -1763,6 +1760,7 @@ int main(int argc, char *argv[]) {
    pthread_attr_t fpsa;
    sigset_t set;
    pthread_t sigThread;
+   int64_t frameDuration; /* Input frame duration */
 
    setupUserOpts(&ctx, argc, argv);
    ctx.omxtimebase.num=1;
@@ -1774,7 +1772,9 @@ int main(int argc, char *argv[]) {
       exit(1);
    }
    ctx.nalEntry.nalBufOffset=0;
-   ctx.framecount=0;
+   ctx.nalEntry.pts=0;
+   ctx.framesOut=0;
+   ctx.framesIn=0;
    ctx.componentFlags=0;
    ctx.componentFlags=0;
    ctx.encBufferFilled=0;
@@ -1828,29 +1828,15 @@ int main(int argc, char *argv[]) {
          fprintf(stderr,"WARNING: extradata too big for input buffer - ignoring...\n");
    }
 
-   ctx.audioPTS=ctx.ic->streams[ctx.inVidStreamIdx]->start_time;
-   ctx.videoPTS=ctx.ic->streams[ctx.inVidStreamIdx]->start_time;
-   switch (ctx.ptsOpt) {
-      case 0:
-         printf("Using frame pts for timestamps\n");
-      break;
-      case 1:
-         printf("Using frame dts for timestamps\n");
-      break;
-      case 2:
-         printf("Using frame duration to calculate timestamps\n");
-      break;
-      default:
-         printf("Invalid selection for option -p: using defaults (frame duration)\n");
-         ctx.ptsOpt=2;
-      break;
-   }
-
+   ctx.audioPTS=0;
+   ctx.videoPTS=0;
+   frameDuration=0;
    /* Feed the decoder frames until the parameters are identified and port 131 changes state */
    for (j=0; ctx.state!=TUNNELSETUP; j++) {
       p=getNextVideoPacket(&ctx);
       if (p!=NULL) {
          fillDecBuffers(&ctx,j,p);
+         frameDuration+=p->duration;
          av_packet_free(&p);
       }
       else
@@ -1871,6 +1857,11 @@ int main(int argc, char *argv[]) {
          printf("Identified the parameters after %d video frames.\n", j);
          start = time(NULL);
          configure(&ctx);
+         frameDuration/=j;
+         ctx.omxDuration=av_rescale_q(frameDuration, ctx.ic->streams[ctx.inVidStreamIdx]->time_base, ctx.omxtimebase);
+         printf("Average Frame duration: %lldms\n", ctx.omxDuration/1000); /* OMX time base is micro seconds */
+         if (ctx.omxFPS==0) ctx.omxFPS=ctx.omxtimebase.den/ctx.omxDuration;
+         printf("Encoder using %lf fps\n", ctx.omxFPS);
          pthread_attr_init(&fpsa);
          pthread_attr_setdetachstate(&fpsa, PTHREAD_CREATE_DETACHED);
          pthread_create(&fpst, &fpsa, fps, NULL); /* Run fps calculator in another thread */
@@ -1906,7 +1897,8 @@ int main(int argc, char *argv[]) {
    
    end = time(NULL);
 
-   printf("\nProcessed %lli frames in %d seconds; %llif/s\n\n\n", ctx.framecount, end-start, (ctx.framecount/(end-start)));
+   printf("\nDropped frames: %f\%\n",100*(ctx.framesIn-ctx.framesOut)/ctx.framesIn);
+   printf("Processed %lli frames in %d seconds; %llif/s\n\n\n", ctx.framesOut, end-start, (ctx.framesOut/(end-start)));
    printf("Time waiting for encoder to finish: %.2lfs\n",(double)ctx.encWaitTime*1E-5);
    
    if (ctx.oc) {

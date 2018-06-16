@@ -8,18 +8,18 @@ See the warnings in the comments at the top of omxtx.c
 This version has been tested on a raspberry PI 3 running Arch Linux, ffmpeg version:
 
 ```
-ffmpeg version 3.2.2 Copyright (c) 2000-2016 the FFmpeg developers
-  built with gcc 6.2.1 (GCC) 20160830
-  configuration: --prefix=/usr --disable-debug --disable-static --disable-stripping --enable-avisynth --enable-avresample --enable-fontconfig --enable-gmp --enable-gnutls --enable-gpl --enable-ladspa --enable-libass --enable-libbluray --enable-libfreetype --enable-libfribidi --enable-libgsm --enable-libiec61883 --enable-libmodplug --enable-libmp3lame --enable-libopencore_amrnb --enable-libopencore_amrwb --enable-libopenjpeg --enable-libopus --enable-libpulse --enable-libschroedinger --enable-libsoxr --enable-libspeex --enable-libssh --enable-libtheora --enable-libv4l2 --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx264 --enable-libx265 --enable-libxvid --enable-netcdf --enable-shared --enable-version3 --enable-x11grab --host-cflags='"-fPIC"'
-  libavutil      55. 34.100 / 55. 34.100
-  libavcodec     57. 64.101 / 57. 64.101
-  libavformat    57. 56.100 / 57. 56.100
-  libavdevice    57.  1.100 / 57.  1.100
-  libavfilter     6. 65.100 /  6. 65.100
-  libavresample   3.  1.  0 /  3.  1.  0
-  libswscale      4.  2.100 /  4.  2.100
-  libswresample   2.  3.100 /  2.  3.100
-  libpostproc    54.  1.100 / 54.  1.100
+ffmpeg version 4.0 Copyright (c) 2000-2018 the FFmpeg developers
+  built with gcc 8.1.0 (GCC)
+  configuration: --prefix=/usr --disable-debug --disable-static --disable-stripping --enable-avresample --enable-fontconfig --enable-gmp --enable-gnutls --enable-gpl --enable-ladspa --enable-libass --enable-libbluray --enable-libdrm --enable-libfreetype --enable-libfribidi --enable-libgsm --enable-libiec61883 --enable-libmodplug --enable-libmp3lame --enable-libopencore_amrnb --enable-libopencore_amrwb --enable-libopenjpeg --enable-libopus --enable-libpulse --enable-libsoxr --enable-libspeex --enable-libssh --enable-libtheora --enable-libv4l2 --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx264 --enable-libx265 --enable-libxcb --enable-libxml2 --enable-libxvid --enable-omx --enable-shared --enable-version3 --host-cflags='"-fPIC"'
+  libavutil      56. 14.100 / 56. 14.100
+  libavcodec     58. 18.100 / 58. 18.100
+  libavformat    58. 12.100 / 58. 12.100
+  libavdevice    58.  3.100 / 58.  3.100
+  libavfilter     7. 16.100 /  7. 16.100
+  libavresample   4.  0.  0 /  4.  0.  0
+  libswscale      5.  1.100 /  5.  1.100
+  libswresample   3.  1.100 /  3.  1.100
+  libpostproc    55.  1.100 / 55.  1.100
 Hyper fast Audio and Video encoder
 usage: ffmpeg [options] [[infile options] -i infile]... {[outfile options] outfile}...
 

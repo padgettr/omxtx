@@ -388,7 +388,6 @@ static int mapCodec(enum AVCodecID id) {
    printf("Mapping codec ID %d (%x)\n", id, id);
    switch (id) {
       case AV_CODEC_ID_MPEG2VIDEO:
-      case AV_CODEC_ID_MPEG2VIDEO_XVMC:
          return OMX_VIDEO_CodingMPEG2;
       case AV_CODEC_ID_H264:
          return OMX_VIDEO_CodingAVC;
@@ -518,8 +517,6 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       oflow->time_base = iflow->time_base; /* Time base hint */
    }
 
-   printf("Input:\n");
-   av_dump_format(ic, 0, ic->filename, 0);
    printf("\nOutput:\n");
    av_dump_format(oc, 0, oname, 1);
 
@@ -1516,7 +1513,7 @@ static int openInputFile(struct context *ctx) {
    AVFormatContext *ic=NULL;   /* Input context */
    int err;
 
-   av_register_all();
+   //av_register_all();
 
    if ((err = avformat_open_input(&ic, ctx->iname, NULL, NULL) != 0)) {
       fprintf(stderr, "Failed to open '%s': %s\n", ctx->iname, strerror(err));
@@ -1542,6 +1539,10 @@ static int openInputFile(struct context *ctx) {
       }
    }
    ctx->ic=ic;
+
+   printf("Input:\n");
+   av_dump_format(ic, 0, ctx->iname, 0);
+
    return ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id;   /* Return the codec ID for the video stream */
 }
 

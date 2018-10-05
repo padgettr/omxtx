@@ -1,16 +1,17 @@
 omxtx
 =====
 
-This is a simple OpenMAX transcoder for the Raspberry Pi.
+This project is forked from github: dickontoo/omxtx "a simple OpenMAX transcoder for the Raspberry Pi".
+Thanks go to dickontoo for the concept and original code!
 
 See the warnings in the comments at the top of omxtx.c
 
 This version has been tested on a raspberry PI 3 running Arch Linux, ffmpeg version:
 
 ```
-ffmpeg version 4.0 Copyright (c) 2000-2018 the FFmpeg developers
-  built with gcc 8.1.0 (GCC)
-  configuration: --prefix=/usr --disable-debug --disable-static --disable-stripping --enable-avresample --enable-fontconfig --enable-gmp --enable-gnutls --enable-gpl --enable-ladspa --enable-libass --enable-libbluray --enable-libdrm --enable-libfreetype --enable-libfribidi --enable-libgsm --enable-libiec61883 --enable-libmodplug --enable-libmp3lame --enable-libopencore_amrnb --enable-libopencore_amrwb --enable-libopenjpeg --enable-libopus --enable-libpulse --enable-libsoxr --enable-libspeex --enable-libssh --enable-libtheora --enable-libv4l2 --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx264 --enable-libx265 --enable-libxcb --enable-libxml2 --enable-libxvid --enable-omx --enable-shared --enable-version3 --host-cflags='"-fPIC"'
+ffmpeg version n4.0.2 Copyright (c) 2000-2018 the FFmpeg developers
+  built with gcc 8.2.0 (GCC)
+  configuration: --prefix=/usr --disable-debug --disable-static --disable-stripping --enable-avresample --enable-fontconfig --enable-gmp --enable-gnutls --enable-gpl --enable-ladspa --enable-libass --enable-libbluray --enable-libdrm --enable-libfreetype --enable-libfribidi --enable-libgsm --enable-libiec61883 --enable-libjack --enable-libmodplug --enable-libmp3lame --enable-libopencore_amrnb --enable-libopencore_amrwb --enable-libopenjpeg --enable-libopus --enable-libpulse --enable-libsoxr --enable-libspeex --enable-libssh --enable-libtheora --enable-libv4l2 --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx264 --enable-libx265 --enable-libxcb --enable-libxml2 --enable-libxvid --enable-omx --enable-shared --enable-version3 --host-cflags='"-fPIC"'
   libavutil      56. 14.100 / 56. 14.100
   libavcodec     58. 18.100 / 58. 18.100
   libavformat    58. 12.100 / 58. 12.100
@@ -45,8 +46,11 @@ To try out vp8 decoding requires:
 ```
 in /boot/config.txt
 
+This version has an enhanced deinterlace capability, and can output 1 frame per field as a user option.
+It has been tested with mpeg2 avi/mkv, divx avi, mjpeg avi input all to h264 mkv output.
+WARNING: Some audio desync was noted with pcm audio input streams! All AC3 was OK.
 
-Dr. R. Padgett, November 2016
+Dr. R. Padgett, October 2018
 
 Copyright
 =========
@@ -54,7 +58,7 @@ Copyright
 omxtx - OpenMAX transcoder for the Raspberry Pi
 Copyright (C) 2012, 2013 Dickon Hood <dickon@fluff.org>
 
-This version 2014 - 2016 Rodney Padgett <rod_padgett@hotmail.com>
+This version 2014 - 2018 Rodney Padgett <rod_padgett@hotmail.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

@@ -4,7 +4,14 @@ Is it worth using more than 1 encoder buffer?
 What is 'encoder time'?
 * This is the rough time in seconds that the output buffer was empty (i.e. nothing to do) during the empty encoder buffer loop. Numbers close to zero would indicate a fast encode, which would probably benefit from more encoder buffers and a separate thread for the encoder buffer empty. Does not include time taken writing output file to disk; however this is generally very small compared to the encode time. Really only any use during development.
 
+What is 'pts delta'?
+* This is the difference between pts (picture time stamps) derived from the input, and actual pts recorded in the output file.
+
 Why won't vp8 / mjpeg decode work?
 * start_file=start_x.elf
   fixup_file=fixup_x.dat
   is required in /boot/config.txt. Note that these are not hardware decoders, they are built into the firmware as software decoders running on the gpu, so expect little cpu usage.
+
+My input is 50fps interlaced, but the output is only 25fps with or without the deinterlacer.
+* It seems that some files are encoded such that ffmpeg detects them as 50 fps, but this is really 50 fields per seconds, two fields making up one frame. The omx decoder detects the frame rate, wich will be half in this case. By default, the de-interlacer id set to output one frame for the two interlaced fields. This can be changed by passing the -d0 option, increasing the output to 50fps deinterlaced.
+ 

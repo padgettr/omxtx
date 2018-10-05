@@ -13,7 +13,7 @@
  * Usage: type ./omxtx after make for usage / options
  *
  * This version has been substantially changed to add new functionality, and
- * compatibility with ffmpeg 3.2.2
+ * compatibility with ffmpeg >= 3.2.2
  * 
  *
  * Dr. R. Padgett <rod_padgett@hotmail.com> May 2016
@@ -37,12 +37,6 @@
 
 /* NOTES: rpi is 32 bit: int and long, int32 are all 4 byte, long long and int64 are 8 byte
  *
- *        The output tick from the encoder is sometimes not correct. This version
- *        uses the input duration to generate timestamps for the output pts, by assuming
- *        each output frame corresponds to an input frame. Assumes constant framerates and
- *        that no frames will be dropped.
- *
- *        ffmpeg docs: https://www.ffmpeg.org/documentation.html
  */
 
 //#define DEBUG
@@ -58,7 +52,6 @@
 #include "bcm_host.h"
 #include "libavformat/avformat.h"
 #include "libavutil/avutil.h"
-//#include "libavcodec/avcodec.h"
 #include "libavutil/mathematics.h"
 #include "libavformat/avio.h"
 #include <error.h>
@@ -82,11 +75,12 @@
 #include <unistd.h>
 #include <signal.h>
 
+/* Defined in OMX_Types.h */
 static OMX_VERSIONTYPE SpecificationVersion = {
-   .s.nVersionMajor = 1,
-   .s.nVersionMinor = 1,
-   .s.nRevision     = 2,
-   .s.nStep         = 0
+   .s.nVersionMajor = 1,   /* OMX_VERSION_MAJOR */
+   .s.nVersionMinor = 1,   /* OMX_VERSION_MINOR */
+   .s.nRevision     = 2,   /* OMX_VERSION_REVISION */
+   .s.nStep         = 0    /* OMX_VERSION_STEP */
 };
 
 /* Hateful things: */
@@ -154,7 +148,8 @@ typedef struct {
    off_t nalBufOffset;
    int64_t tick;
    int64_t pts;
-   int64_t pre_pts;
+   int64_t duration;
+   AVRational fps;
 } OMXTX_NAL_ENTRY;
 
 static struct context {
@@ -175,21 +170,24 @@ static struct context {
    int      inVidStreamIdx;
    int      inAudioStreamIdx; /* <0 if there is no audio stream */
    int      userAudioStreamIdx;
-   int64_t  audioPTS;
-   int64_t  videoPTS;
-   int64_t  omxDuration;   /* Assumed output frame duration based on input frame duration, in omx time base */
+   int64_t  audioPTS;      /* Input PTS */
+   int64_t  videoPTS;      /* Input PTS */
    OMX_HANDLETYPE   dec, enc, rsz, dei, spl, vid;
    pthread_mutex_t decBufLock;
    AVBitStreamFilterContext *bsfc;
    int   bitrate;
-   double omxFPS;
+   double omxFPS;          /* Output frame rate for display purposes */
    char  *iname;
    char  *oname;
    AVRational omxtimebase; /* OMX time base is micro seconds */
    OMX_CONFIG_RECTTYPE *cropRect;
    int outputWidth;
    int outputHeight;
-   int naluInputFormat;   /* 1 if input is h264 annexb, 0 otherwise */ 
+   int naluInputFormat;    /* 1 if input is h264 annexb, 0 otherwise */
+   int minQuant;           /* Minimum allowed quantisation: lower is better quality but bigger file size */
+   int maxQuant;           /* Maximum allowed quantisation */
+   int interlaceMode;
+   int dei_ofpf;           /* Deinterlacer: output 1 frame per field */
 } ctx;
 
 /* Command line option flags */
@@ -202,7 +200,7 @@ static struct context {
 #define UFLAGS_CROP          (uint16_t)(1U<<6)
 #define UFLAGS_AUTO_SCALE_X  (uint16_t)(1U<<7)
 #define UFLAGS_AUTO_SCALE_Y  (uint16_t)(1U<<8)
-#define UFLAGS_USE_OMX_TICK  (uint16_t)(1U<<9)
+#define UFLAGS_MAKE_UP_PTS  (uint16_t)(1U<<9)
 
 /* Component flags */
 #define CFLAGS_RSZ       (uint8_t)(1U<<0)
@@ -373,6 +371,7 @@ static void exitHandler(void) {
    printf("\n\nIn exit handler, after %lli frames:\n", ctx.framesOut);
    if (ctx.userFlags & UFLAGS_VERBOSE) {
       dumpport(ctx.dec, PORT_DEC);
+      dumpport(ctx.dec, PORT_DEC+1);
       dumpport(ctx.enc, PORT_ENC+1);
    }
 
@@ -383,7 +382,6 @@ static void exitHandler(void) {
    cleanup(&ctx);
 }
 
-/* Map libavcodec IDs to OMX IDs */
 static int mapCodec(enum AVCodecID id) {
    printf("Mapping codec ID %d (%x)\n", id, id);
    switch (id) {
@@ -399,6 +397,88 @@ static int mapCodec(enum AVCodecID id) {
          return OMX_VIDEO_CodingMPEG4;
       default:
          return -1;
+   }
+}
+
+static int mapProfile(enum OMX_VIDEO_AVCPROFILETYPE id) {
+   printf("Mapping profile ID %d (%x)\n", id, id);
+   switch (id) {
+      case OMX_VIDEO_AVCProfileBaseline:
+         return FF_PROFILE_H264_BASELINE;
+      case OMX_VIDEO_AVCProfileMain:
+         return FF_PROFILE_H264_MAIN;
+      case OMX_VIDEO_AVCProfileExtended:
+         return FF_PROFILE_H264_EXTENDED;
+      case OMX_VIDEO_AVCProfileHigh:
+         return FF_PROFILE_H264_HIGH;
+      case OMX_VIDEO_AVCProfileHigh10:
+         return FF_PROFILE_H264_HIGH_10;
+      case OMX_VIDEO_AVCProfileHigh422:
+         return FF_PROFILE_H264_HIGH_422;
+      case OMX_VIDEO_AVCProfileHigh444:
+         return FF_PROFILE_H264_HIGH_444;
+      case OMX_VIDEO_AVCProfileConstrainedBaseline:
+         return FF_PROFILE_H264_CONSTRAINED_BASELINE;
+      default:
+         return FF_PROFILE_UNKNOWN;
+   }
+}
+
+static int mapLevel(enum OMX_VIDEO_AVCLEVELTYPE id) {
+   printf("Mapping level ID %d (%x)\n", id, id);
+   switch (id) {
+      case OMX_VIDEO_AVCLevel1:
+         return 10;
+      case OMX_VIDEO_AVCLevel1b:
+         return 11;
+      case OMX_VIDEO_AVCLevel11:
+         return 11;
+      case OMX_VIDEO_AVCLevel12:
+         return 12;
+      case OMX_VIDEO_AVCLevel13:
+         return 13;
+      case OMX_VIDEO_AVCLevel2:
+         return 20;
+      case OMX_VIDEO_AVCLevel21:
+         return 21;
+      case OMX_VIDEO_AVCLevel22:
+         return 22;
+      case OMX_VIDEO_AVCLevel3:
+         return 30;
+      case OMX_VIDEO_AVCLevel31:
+         return 31;
+      case OMX_VIDEO_AVCLevel32:
+         return 32;
+      case OMX_VIDEO_AVCLevel4:
+         return 40;
+      case OMX_VIDEO_AVCLevel41:
+         return 41;
+      case OMX_VIDEO_AVCLevel42:
+         return 42;
+      case OMX_VIDEO_AVCLevel5:
+         return 50;
+      case OMX_VIDEO_AVCLevel51:
+         return 51;
+      default:
+         return FF_LEVEL_UNKNOWN;
+   }
+}
+
+static int mapColour(enum OMX_COLOR_FORMATTYPE id) {
+   printf("Mapping colour ID %d (%x)\n", id, id);
+   switch (id) {
+      case OMX_COLOR_FormatYUV420PackedPlanar:
+         return AV_PIX_FMT_YUV420P;
+      case OMX_COLOR_FormatYUV420PackedSemiPlanar:
+         return AV_PIX_FMT_NONE;       /* Can't match this up */
+      case OMX_COLOR_Format16bitRGB565:
+         return AV_PIX_FMT_RGB565LE;   /* This is little endian; AV_PIX_FMT_RGB565BE for big endian */
+      case OMX_COLOR_Format24bitBGR888:
+         return AV_PIX_FMT_BGR24;
+      case OMX_COLOR_Format32bitABGR8888:
+         return AV_PIX_FMT_ABGR;
+      default:
+         return AV_PIX_FMT_NONE;
    }
 }
 
@@ -459,7 +539,7 @@ static const char *mapComponent(struct context *ctx, OMX_HANDLETYPE handle) {
 /* oname is output filename, ctx->oname, idx is video stream index ctx->inVidStreamIdx
  * ic - input AVFormatContext; allocated by avformat_open_input() on input file open
  */
-static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname, int idx, const OMX_PARAM_PORTDEFINITIONTYPE *prt) {
+static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname, int idx, const OMX_PARAM_PORTDEFINITIONTYPE *prt, OMX_VIDEO_PARAM_PROFILELEVELTYPE *level) {
    const OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
    AVFormatContext   *oc=NULL;
    AVStream          *iflow, *oflow;
@@ -467,7 +547,6 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
    viddef = &prt->format.video; /* Decoder output format structure */
 
    /* allocate avformat context - avformat_free_context() can be used to free */
-
    avformat_alloc_output_context2(&oc, NULL, NULL, oname);
    if (!oc) {
       fprintf(stderr, "Failed to alloc outputcontext\n");
@@ -487,17 +566,31 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       
    oflow->codecpar->width = viddef->nFrameWidth;   /* Set  AVCodecContext details to OMX_VIDEO reported values */
    oflow->codecpar->height = viddef->nFrameHeight;
-   oflow->codecpar->bit_rate = ctx.bitrate;   /* User specified bit rate or default */
-   oflow->codecpar->profile = FF_PROFILE_H264_HIGH;
-   oflow->codecpar->level = 41;   /* The profile level: hard coded here to 4.1 */
+   oflow->codecpar->bit_rate = ctx.bitrate;        /* User specified bit rate or default */
+   oflow->codecpar->profile = mapProfile(level->eProfile);
+   oflow->codecpar->level = mapLevel(level->eLevel);
 
-   oflow->time_base = ctx.omxtimebase;               /* Set timebase hint for muxer: will be overwritten on header write depending on container format */
-   oflow->codecpar->format = AV_PIX_FMT_YUV420P; // TODO: should match up with OMX formats!
-   oflow->avg_frame_rate = iflow->avg_frame_rate; /* Set framerate of output stream */
-   oflow->r_frame_rate = iflow->r_frame_rate;
+   oflow->time_base = ctx.omxtimebase;             /* Set timebase hint for muxer: will be overwritten on header write depending on container format */
+   oflow->codecpar->format = mapColour(viddef->eColorFormat);
+   oflow->avg_frame_rate = ctx.nalEntry.fps;
+   oflow->r_frame_rate = ctx.nalEntry.fps;
    oflow->start_time=0;
 
-   if ((ctx.userFlags & UFLAGS_RESIZE)==0) { /* If resizing use default 1:1 pixel aspect, otherwise copy apect ratio from input */
+   if (ctx.userFlags & UFLAGS_RESIZE) {
+      if ((ctx.userFlags & UFLAGS_AUTO_SCALE_X) || (ctx.userFlags & UFLAGS_AUTO_SCALE_Y)) {
+         oflow->codecpar->sample_aspect_ratio.num = 1;
+         oflow->codecpar->sample_aspect_ratio.den = 1;
+         oflow->sample_aspect_ratio.num = 1;
+         oflow->sample_aspect_ratio.den = 1;
+      }
+      else {   /* Set this to 'unknown' for now */
+         oflow->codecpar->sample_aspect_ratio.num = 0;
+         oflow->codecpar->sample_aspect_ratio.den = 1;
+         oflow->sample_aspect_ratio.num = 0;
+         oflow->sample_aspect_ratio.den = 1;
+      }
+   }
+   else {   /* No resize requested: copy apect ratio from input */
       oflow->codecpar->sample_aspect_ratio.num = iflow->codecpar->sample_aspect_ratio.num;
       oflow->codecpar->sample_aspect_ratio.den = iflow->codecpar->sample_aspect_ratio.den;
       oflow->sample_aspect_ratio.num = iflow->codecpar->sample_aspect_ratio.num;
@@ -527,7 +620,7 @@ static void writeAudioPacket(AVPacket *pkt) {
    int ret;
    pkt->stream_index=1;
    
-   if (ctx.userFlags & UFLAGS_USE_OMX_TICK && pkt->dts > ctx.audioPTS)
+   if (! (ctx.userFlags & UFLAGS_MAKE_UP_PTS) && pkt->dts > ctx.audioPTS)
       ctx.audioPTS=pkt->dts;
    else
       ctx.audioPTS+=pkt->duration; /* Use packet duration */
@@ -553,18 +646,6 @@ static int openOutput(struct context *ctx) {
 
    printf("Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
 
-#ifdef OLD_CODE /* Extra data is now copied by avcodec_parameters_copy() in makeOutputContext() */
-   if (ctx->inAudioStreamIdx>0) {
-      if (ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata) {
-         printf(" Found extradata in audio stream: WIP!\n");
-         if (av_reallocp(&ctx->oc->streams[1]->codecpar->extradata, ctx->oc->streams[1]->codecpar->extradata_size + ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE) == 0) {
-            memcpy(ctx->oc->streams[1]->codecpar->extradata + ctx->oc->streams[1]->codecpar->extradata_size, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata, ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size);
-            ctx->oc->streams[1]->codecpar->extradata_size += ctx->ic->streams[ctx->inAudioStreamIdx]->codecpar->extradata_size;
-            memset(ctx->oc->streams[1]->codecpar->extradata + ctx->oc->streams[1]->codecpar->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE); /* Add extra zeroed bytes to prevent certain optimised readers from reading past the end */
-         }
-      }
-   }
-#endif
    if (!(ctx->oc->oformat->flags & AVFMT_NOFILE)) {
      ret = avio_open(&ctx->oc->pb, ctx->oname, AVIO_FLAG_WRITE);
      if (ret < 0) {
@@ -921,6 +1002,7 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureResizer(struct context *ctx, OMX_P
       imgdef->nFrameHeight = ctx->outputHeight;
    }
 
+   /* Force component to re-calculate these */
    imgdef->nStride = 0;
    imgdef->nSliceHeight = 0;
 
@@ -946,7 +1028,7 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureDeinterlacer(struct context *ctx, 
    OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
    OMX_PARAM_PORTDEFINITIONTYPE *imgportdef;
    OMX_IMAGE_PORTDEFINITIONTYPE *imgdef;
-   
+
    /* Set input port parameters */
    sendCommand(ctx->dei, OMX_CommandPortDisable, PORT_DEI, CFLAGS_DEI, 1);
 
@@ -970,11 +1052,11 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureDeinterlacer(struct context *ctx, 
    /* Setup filter parameters */
    image_filter->nPortIndex = PORT_DEI+1;
    image_filter->nNumParams = 4;
-   image_filter->nParams[0] = 3;
-   image_filter->nParams[1] = 0; // default frame interval
-   image_filter->nParams[2] = 1; // half framerate
-   image_filter->nParams[3] = 1; // use qpus
-   image_filter->eImageFilter = OMX_ImageFilterDeInterlaceFast;
+   image_filter->nParams[0] = ctx->interlaceMode; /* OMX_INTERLACETYPE: see OMX_Broadcom.h. "Modes 1 and 2 are not handled. The line doubler algorithm only takes values 3 or 4, whilst the other two accept 0, 3, 4, or 5."; omxplayer hard codes this to 3. */
+   image_filter->nParams[1] = 0; /* default frame interval */
+   image_filter->nParams[2] = ctx->dei_ofpf; /* Setting one frame per field: NOTE this will double the frame rate and screw up the pts! This will be corrected in emptyEncoderBuffers() by using the duration. */
+   image_filter->nParams[3] = 1; /* use qpus - quad processing units in the gpu */
+   image_filter->eImageFilter = OMX_ImageFilterDeInterlaceAdvanced; /* Options are OMX_ImageFilterDeInterlaceLineDouble, OMX_ImageFilterDeInterlaceAdvanced, and OMX_ImageFilterDeInterlaceFast; see OMX_IVCommon.h for available filters; omxplayer uses OMX_ImageFilterDeInterlaceAdvanced for < 720x576 */
    OERR(OMX_SetConfig(ctx->dei, OMX_IndexConfigCommonImageFilterParameters, image_filter));
 
    /* Setup video port definition for next component */
@@ -993,6 +1075,9 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureDeinterlacer(struct context *ctx, 
    viddef->eCompressionFormat = imgdef->eCompressionFormat;
    viddef->eColorFormat = imgdef->eColorFormat;
    viddef->pNativeWindow = imgdef->pNativeWindow;
+
+   if (image_filter->nParams[2]==0)
+      viddef->xFramerate*=2;
 
    return portdef;
 }
@@ -1030,17 +1115,47 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureMonitor(struct context *ctx, OMX_P
    return portdef; /* Unchanged in this case: outputs are a copy of input */
 }
 
-static void configure (struct context *ctx) {
+static void configure(struct context *ctx) {
    OMX_VIDEO_PARAM_PROFILELEVELTYPE *level;
    OMX_VIDEO_PARAM_BITRATETYPE *bitrate;
    OMX_PARAM_PORTDEFINITIONTYPE *portdef;
    OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
    OMX_HANDLETYPE prev; /* Used in setting pipelines: previous handle */
+   OMX_PARAM_U32TYPE *minQuant;
+   OMX_PARAM_U32TYPE *maxQuant;
+   OMX_CONFIG_INTERLACETYPE *interlaceType;
+
    int pp;
 
    MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
 
-   printf("Decoder has changed settings.  Setting up encoder.\n");
+   /* Get type of interlacing used, if any */
+   MAKEME(interlaceType, OMX_CONFIG_INTERLACETYPE);
+   interlaceType->nPortIndex = PORT_DEC+1;
+   OERR(OMX_GetConfig(ctx->dec, OMX_IndexConfigCommonInterlace, interlaceType));
+   ctx->interlaceMode=interlaceType->eMode;
+   switch (ctx->interlaceMode) {
+      case OMX_InterlaceProgressive: /* mode 0: no need for de-interlacer */
+         printf("Progresive scan detected, de-interlacing not required.\n", ctx->interlaceMode);
+         if (ctx->userFlags & UFLAGS_DEINTERLACE)
+            ctx->userFlags ^= UFLAGS_DEINTERLACE;
+      break;
+      case OMX_InterlaceFieldSingleUpperFirst:   /* mode 1: The data is interlaced, fields sent separately in temporal order, with upper field first */
+      case OMX_InterlaceFieldSingleLowerFirst:   /* mode 2: The data is interlaced, fields sent separately in temporal order, with lower field first */
+         printf("Unsupported interlace format %i detected (separate field per frame).\n", ctx->interlaceMode);
+         if (ctx->userFlags & UFLAGS_DEINTERLACE) {
+            printf("Disabling deinterlacer.\n");
+            ctx->userFlags ^= UFLAGS_DEINTERLACE;
+         }
+      break;
+      default:
+         printf("*** Source material is interlaced! Interlace type: %i ***\n", interlaceType->eMode);
+         printf("*** Consider using the de-interlacer option -d ***\n");
+         // TODO: Switch on interlacer automatically? If so, will need to consider carefully the frame rate: if input is interlaced and 50fps, but omx detects 25fps, it's probably one field per frame and should output with one field per frame.
+      break;
+   }
+
+   printf("Setting up encoder.\n");
 
    /* Get the decoder OUTPUT port state */
    portdef->nPortIndex = PORT_DEC+1;
@@ -1103,14 +1218,8 @@ static void configure (struct context *ctx) {
    requestStateChange(ctx->enc, OMX_StateIdle, 1);
 
    /* setup encoder output port  - viddef points to format.video of previous component output port */
-   if (ctx->bitrate == 0)
-      viddef->nBitrate = (2*1024*1024);
-   else
-      viddef->nBitrate = ctx->bitrate;
-   ctx->bitrate = viddef->nBitrate;
-
+   viddef->nBitrate = ctx->bitrate;
    viddef->eCompressionFormat = OMX_VIDEO_CodingAVC;
-   viddef->nStride = viddef->nSliceHeight = viddef->eColorFormat = 0;
    portdef->nPortIndex = PORT_ENC+1;
    OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamPortDefinition, portdef));
 
@@ -1136,14 +1245,6 @@ static void configure (struct context *ctx) {
       pixaspect->nX = 1;
       pixaspect->nY = 1;
       OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmPixelAspectRatio, pixaspect));
-   }
-
-
-   if (ctx->userFlags & UFLAGS_VERBOSE) {
-      MAKEME(level, OMX_VIDEO_PARAM_PROFILELEVELTYPE);
-      level->nPortIndex = PORT_ENC+1;
-      OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoProfileLevelCurrent, level));
-      printf("OMX H264 Encoder: Current level:\t\t%x\nCurrent profile:\t%x\n", level->eLevel, level->eProfile);
    }
 
    /* Allocate buffers; state must be idle & port disabled
@@ -1230,17 +1331,48 @@ static void configure (struct context *ctx) {
       dumpport(ctx->enc, PORT_ENC+1);
    }
 
+   MAKEME(level, OMX_VIDEO_PARAM_PROFILELEVELTYPE);
+   level->nPortIndex = PORT_ENC+1;
+   OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoProfileLevelCurrent, level));
+
+   if (ctx->minQuant > 0) {
+      MAKEME(minQuant, OMX_PARAM_U32TYPE);
+      minQuant->nU32 = ctx->minQuant;
+      minQuant->nPortIndex = PORT_ENC+1;
+      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeMinQuant, minQuant));
+   }
+
+   if (ctx->maxQuant > 0) {
+      MAKEME(maxQuant, OMX_PARAM_U32TYPE);
+      maxQuant->nU32 = ctx->maxQuant;
+      maxQuant->nPortIndex = PORT_ENC+1;
+      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeMaxQuant, maxQuant));
+   }
+
+   /* Get the frame rate at the encoder output
+    * This is detected and set by the decoder:
+    * seems to be set from stream data if present or from omx ticks
+    * Constant framerate is assumed.
+    */
+   if (portdef->format.video.xFramerate==0) {   /* If unknown use average fps from input */
+      fprintf(stderr, "WARNING: frame rate unknown - setting rate from input. This may not be correct!\n");
+      portdef->format.video.xFramerate=(ctx->ic->streams[ctx->inVidStreamIdx]->avg_frame_rate.num/ctx->ic->streams[ctx->inVidStreamIdx]->avg_frame_rate.den)*(1<<16);
+   }
+
+   ctx->nalEntry.fps.num=portdef->format.video.xFramerate;   /* Q16 format */
+   ctx->nalEntry.fps.den=(1<<16);
+   
+   ctx->omxFPS=av_q2d(ctx->nalEntry.fps); /* Convert to double */
+   ctx->nalEntry.duration=(double)ctx->omxtimebase.den/ctx->omxFPS;  /* Estimate frame duration in omx timebase units */
+
    /* Make an output context if output is not raw: */
    if ((ctx->userFlags & UFLAGS_RAW) == 0) {
-      ctx->oc = makeOutputContext(ctx->ic, ctx->oname, ctx->inVidStreamIdx, portdef);
+      ctx->oc = makeOutputContext(ctx->ic, ctx->oname, ctx->inVidStreamIdx, portdef, level);
       if (!ctx->oc) {
          fprintf(stderr, "Create output AVFormatContext failed.\n");
          exit(1);
       }
    }
-
-   /* omxFPS is used to calculate the encoding frame rate - it is not used for timing purposes! */
-   ctx->omxFPS=(double)portdef->format.video.xFramerate/(double)(1<<16); /* WARNING: this may not be accurate! */
 
    ctx->state=OPENOUTPUT;
 }
@@ -1263,6 +1395,7 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
    viddef->nFrameHeight = ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->height;
    viddef->eCompressionFormat = mapCodec(ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id);
    viddef->bFlagErrorConcealment = 0;
+   /* It is NOT required to set xFramerate from ffmpeg avg_frame_rate.den; the encoder will be passed the detected frame rate (I assume from the timestamps / omxtick or from raw stream data). */
    OERR(OMX_SetParameter(ctx->dec, OMX_IndexParamPortDefinition, portdef));
 
 /* TODO! */
@@ -1298,26 +1431,28 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
 }
 
 static void usage(const char *name) {
-   fprintf(stderr, "Usage: %s [-a[y]] [-b bitrate] [-c crop] [-d] [-m] [-r size] [-x] <infile> <outfile>\n\n"
-      "Where:\n"
+   fprintf(stderr, "Usage: %s [opts] <infile> <outfile>\n\n"
+      "Where opts are:\n"
       "   -a[y] Auto scale the video stream to produce a sample aspect ratio (pixel aspect ratio)\n"
       "         of 1:1. By default the scaling is in the x-direction (image width); this usually\n"
-      "         results more (interpolated) pixels in the x-direction. If y is specified, the scaling\n"
+      "         results in more (interpolated) pixels in the x-direction. If y is specified, the scaling\n"
       "         is done in the y-direction; this usually results in a reduction in resolution in the\n"
       "         y-direction.\n"
       "   -b n  Target bitrate n[k|M] in bits/second (default: 2Mb/s)\n"
-      "   -c c  Crop: 'c' is specified in pixels as width:height:left:top\n"
-      "   -d    Deinterlace\n"
+      "   -c C  Crop: 'C' is specified in pixels as width:height:left:top\n"
+      "   -d[0] Deinterlace: default is to output one frame per two interlaced fields\n"
+      "         If 0 is specified, one frame per field will be output.\n"
       "   -i n  Select audio stream n.\n"
       "   -m    Monitor.  Display the decoder's output\n"
-      "   -p    Use OMX tick for pts, based on input packet dts. Default is to make up pts based\n"
-      "         on the average frame duration calculated during initialisation.\n"
-      "   -r s  Resize: 's' is in pixels specified as widthxheight\n"
-      "   -v    Verbose\n"
+      "   -p    Make up pts based on encoder (constant) framerate. Default is based on input stream dts.\n"
+      "   -q Q  Quantisation limits: 'Q' is specified as min=a:max=b where 0 < a < b < 52.\n"
+      "         Defaults to a=20, b=50.\n"
+      "   -r S  Resize: 'S' is in pixels specified as widthxheight\n"
+      "   -v    Verbose: show input / output states of OMX components\n"
       "\n"
-      "Output container is guessed based on filename.  Use '.nal' for raw output.\n"
+      "Output container is guessed based on filename. Use '.nal' for raw output.\n"
       "\n"
-      "Input file must contain one of MPEG 2, H.264, MPEG4 (H.623), MJPEG or vp8 video.\n"
+      "Input file must contain one of MPEG2, H.264, MPEG4 (H.263), MJPEG or vp8 video.\n"
       "\n", name);
    exit(1);
 }
@@ -1438,6 +1573,31 @@ static int setOutputSize(struct context *ctx, const char *optarg) {
    return 1;
 }
 
+/* Quantisation options. Range 1 to 51, lower numbers are better quality / bigger file size
+ * Default appears to be min=20, max=50. Lower BOTH numbers to increase quality
+ * (setting minQuant to 1 roughly doubles the file size)
+ */
+static int setQuantLimits(struct context *ctx, const char *optarg) {
+   int minq=0;
+   int maxq=0;
+
+   if (optarg!=NULL) {
+      if (sscanf(optarg, "min=%d:max=%d", &minq, &maxq) != 2) {
+         fprintf(stderr,"ERROR: Must specify 'min=a:max=b' where 0 < a < b < 52\n");
+         return 1;
+      }
+   }
+   if (minq > 0 && maxq > minq && maxq < 52) {
+      printf("Setting quantisation limits to qmin=%d, qmax=%d\n", minq, maxq);
+      ctx->minQuant=minq;
+      ctx->maxQuant=maxq;
+      return 0;
+   }
+   fprintf(stderr,"ERROR: Invalid quantisation parameters! Valid range: 0 < qmin < qmax < 52 \n");
+   return 1;
+}
+
+/* WARNING: use is made of optag==NULL in parsing the input options. This is a gnu extension */
 static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
    int opt, j;
 
@@ -1446,28 +1606,33 @@ static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
 
    ctx->bitrate = 2*1024*1024;   /* Default: 2Mb/s */
    ctx->userAudioStreamIdx=-1;   /* Default: guess audio stream */
-   while ((opt = getopt(argc, argv, "a::b:c:di:mpr:v")) != -1) {
+   ctx->minQuant=0;              /* Default minimum quantisation: use 0 avoid resetting from firmware default (20?)*/
+   ctx->maxQuant=0;              /* Default maximum quantisation: use 0 avoid resetting from firmware default (50?)*/
+   ctx->dei_ofpf=1;              /* Deinterlace: set to 0 for one frame per two fields; set to 1 to use one frame per field */
+
+   while ((opt = getopt(argc, argv, "a::b:c:d:i:mpq:r:v")) != -1) {
       switch (opt) {
       case 'a':
-         if (optarg==NULL)
-            ctx->userFlags |= UFLAGS_AUTO_SCALE_X;
-         else if (*optarg=='y')
-            ctx->userFlags |= UFLAGS_AUTO_SCALE_Y;
-         else
-            ctx->userFlags |= UFLAGS_AUTO_SCALE_X;
+         ctx->userFlags |= UFLAGS_AUTO_SCALE_X;
          ctx->userFlags |= UFLAGS_RESIZE;
+         if (optarg!=NULL && *optarg=='y')
+            ctx->userFlags |= UFLAGS_AUTO_SCALE_Y;            
       break;
       case 'b':
          ctx->bitrate = parsebitrate(optarg, ctx->bitrate);
+         if (ctx->bitrate < 128*1024)
+            fprintf(stderr, "WARNING: bit rate too low; use at least 128kb/s!\n", strerror(errno));
       break;
       case 'c':
-         if (setCropRectangle(ctx,optarg)==0)
+         if (setCropRectangle(ctx, optarg)==0)
             ctx->userFlags |= UFLAGS_CROP;
          else
             exit(1);
       break;
       case 'd':
          ctx->userFlags |= UFLAGS_DEINTERLACE;
+         if (optarg!=NULL && *optarg=='0')
+            ctx->dei_ofpf=0;
       break;
       case 'i':
          ctx->userAudioStreamIdx=atoi(optarg);
@@ -1476,10 +1641,14 @@ static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
          ctx->userFlags |= UFLAGS_MONITOR;
       break;
       case 'p':
-         ctx->userFlags |= UFLAGS_USE_OMX_TICK;
+         ctx->userFlags |= UFLAGS_MAKE_UP_PTS;
+      break;
+      case 'q':
+         if (setQuantLimits(ctx, optarg)==1)
+            exit(1);
       break;
       case 'r':
-         if (setOutputSize(ctx,optarg)==0)
+         if (setOutputSize(ctx, optarg)==0)
             ctx->userFlags |= UFLAGS_RESIZE;
          else
             exit(1);
@@ -1567,8 +1736,6 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
    pkt.stream_index = 0;
    pkt.data = ctx->nalEntry.nalBuf;
    pkt.size = ctx->nalEntry.nalBufOffset;
-   //pkt.buf = av_buffer_create(pkt.data, pkt.size, av_buffer_default_free, NULL, 0); // TODO: ctx->nalEntry.nalBuf can't be used here because it gets freed in av_interleaved_write_frame()
-   //pkt.duration=av_rescale_q(ctx->omxDuration, ctx->omxtimebase, ctx->oc->streams[0]->time_base);
    pkt.pts=av_rescale_q(ctx->nalEntry.pts, ctx->omxtimebase, ctx->oc->streams[0]->time_base); /* Transform omx pts to output timebase */
    pkt.dts=pkt.pts; /* Out of order b-frames not supported on rpi: so dts=pts */
    ctx->ptsDelta=(ctx->nalEntry.pts-ctx->nalEntry.tick)/1000;
@@ -1576,14 +1743,14 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
 
    if (nalType==5)   /* This is an IDR frame */
       pkt.flags |= AV_PKT_FLAG_KEY;
-   //if (pkt.buf != NULL)
-      r = av_interleaved_write_frame(ctx->oc, &pkt);
+
+   r = av_interleaved_write_frame(ctx->oc, &pkt);
    if (r != 0) {
       char err[256];
       av_strerror(r, err, sizeof(err));
       fprintf(stderr,"\nFailed to write a video frame: %s (pts: %lld; nal: %i)\n", err, ctx->nalEntry.pts, nalType);
    }
-   else ctx->framesOut++;
+   else ctx->framesOut++; /* This assumes 1 nalu is equivalent to 1 frame */
 }
 
 /* The h264 video data is organized into NAL units (annex b), each of which is effectively a packet
@@ -1647,12 +1814,11 @@ static void emptyEncoderBuffers(struct context *ctx) {
          memcpy(ctx->nalEntry.nalBuf + ctx->nalEntry.nalBufOffset, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
          ctx->nalEntry.nalBufOffset=curNalSize;
          ctx->nalEntry.tick=((((int64_t) ctx->encbufs->nTimeStamp.nHighPart)<<32) | ctx->encbufs->nTimeStamp.nLowPart);
-         
-         if ((ctx->userFlags & UFLAGS_USE_OMX_TICK) && ctx->nalEntry.tick>ctx->nalEntry.pts) /* Check that the tick will increase the current pts */
-            ctx->nalEntry.pts=ctx->nalEntry.tick;
+         if (ctx->nalEntry.tick > ctx->nalEntry.pts)
+            ctx->nalEntry.pts=ctx->nalEntry.tick; /* This is propagated through from the decoder */
          else
-            ctx->nalEntry.pts+=ctx->omxDuration; /* This is based on the input frame duration */
-         
+            ctx->nalEntry.pts+=ctx->nalEntry.duration; /* Something went wrong - make up pts based on detected framerate */
+
          if (ctx->encbufs->nFlags & OMX_BUFFERFLAG_ENDOFNAL) { /* At end of nal */
             nalType=examineNAL(ctx);
             if (ctx->state == RUNNING) writeVideoPacket(ctx, nalType);
@@ -1662,7 +1828,8 @@ static void emptyEncoderBuffers(struct context *ctx) {
             }
             ctx->nalEntry.nalBufOffset = 0;
          }
-         else fprintf(stderr, "Warning: End of NAL not found!\n");
+         else if ( ! ctx->encbufs->nFlags & OMX_BUFFERFLAG_EOS)
+            fprintf(stderr, "\nWarning: End of NAL not found!\n");
       }
    }
    ctx->encBufferFilled=0;                /* Flag that the buffer is empty */
@@ -1710,7 +1877,7 @@ void fillDecBuffers(struct context *ctx, int i, AVPacket *p) {
    int64_t omxTicks;
 
    /* From ffmpeg docs: pkt->pts can be AV_NOPTS_VALUE (-9223372036854775808) if the video format has B-frames, so it is better to rely on pkt->dts if you do not decompress the payload */
-   if ((ctx->userFlags & UFLAGS_USE_OMX_TICK) && p->dts != AV_NOPTS_VALUE)
+   if ( !(ctx->userFlags & UFLAGS_MAKE_UP_PTS) && p->dts != AV_NOPTS_VALUE)
       ctx->videoPTS=p->dts;
    else
       ctx->videoPTS+=p->duration; /* Use packet duration */
@@ -1749,7 +1916,7 @@ void fillDecBuffers(struct context *ctx, int i, AVPacket *p) {
       size -= nsize;
       offset += nsize;
    }
-   ctx->framesIn++;
+   ctx->framesIn++; /* This assumes 1 frame per buffer */
 }
 
 int main(int argc, char *argv[]) {
@@ -1761,7 +1928,6 @@ int main(int argc, char *argv[]) {
    pthread_attr_t fpsa;
    sigset_t set;
    pthread_t sigThread;
-   int64_t frameDuration; /* Input frame duration */
 
    setupUserOpts(&ctx, argc, argv);
    ctx.omxtimebase.num=1;
@@ -1831,13 +1997,11 @@ int main(int argc, char *argv[]) {
 
    ctx.audioPTS=0;
    ctx.videoPTS=0;
-   frameDuration=0;
    /* Feed the decoder frames until the parameters are identified and port 131 changes state */
    for (j=0; ctx.state!=TUNNELSETUP; j++) {
       p=getNextVideoPacket(&ctx);
       if (p!=NULL) {
          fillDecBuffers(&ctx,j,p);
-         frameDuration+=p->duration;
          av_packet_free(&p);
       }
       else
@@ -1858,11 +2022,8 @@ int main(int argc, char *argv[]) {
          printf("Identified the parameters after %d video frames.\n", j);
          start = time(NULL);
          configure(&ctx);
-         frameDuration/=j;
-         ctx.omxDuration=av_rescale_q(frameDuration, ctx.ic->streams[ctx.inVidStreamIdx]->time_base, ctx.omxtimebase);
-         printf("Average Frame duration: %lldms\n", ctx.omxDuration/1000); /* OMX time base is micro seconds */
-         if (ctx.omxFPS==0) ctx.omxFPS=ctx.omxtimebase.den/ctx.omxDuration;
-         printf("Encoder using %lf fps\n", ctx.omxFPS);
+  
+         printf("OMX detected %lf fps\n", ctx.omxFPS);
          pthread_attr_init(&fpsa);
          pthread_attr_setdetachstate(&fpsa, PTHREAD_CREATE_DETACHED);
          pthread_create(&fpst, &fpsa, fps, NULL); /* Run fps calculator in another thread */
@@ -1870,7 +2031,7 @@ int main(int argc, char *argv[]) {
       case QUIT:
          exit(1);
       default:
-         fprintf(stderr, "ERROR: System in an unexpected state: %i.\n",ctx.state);
+         fprintf(stderr, "ERROR: System in an unexpected state: %i.\n", ctx.state);
          exit(1);
    }
    

@@ -16,3 +16,14 @@ Previous: omxtx.13.c
 16-06-2018: Remove line 391: case AV_CODEC_ID_MPEG2VIDEO_XVMC: Not in ffmpeg v4.0
             Remove av_register_all() This has been deprecated and is no longer required.
             Remove ic->filename; deprecated, no longer in input context. Replaced with ctx->iname.
+24-08-2018: Add mapProfile(), mapLevel(), mapColour(). These used to be hard coded (in makeOutputContext()) mappings between OMX and ffmpeg. In configure() removed setting decoder output port colour profile to zero, added get parameter for level.
+            Also had a play with min and max quantisation levels: shows promise for higher quality encoding of e.g. low contrast films. Code added at the end of configure() but doesn't do anything yet (set to defaults).
+            Might also want to check out OMX_IndexParamBrcmVideoInitialQuant and OMX_IndexParamBrcmVideoRCSliceDQuant.
+23-09-2018: Add in quantisation command line options and test: for low contrast film limit qmax to 30 or so (default is 50) and increase bit rate.
+29-09-2018: Check interlace type and set detected type if -d is used, some minor bug fixes & cleanup.
+30-09-2018: Fix timings again - set fps at decoder setup from container retrieved average fps. OMX ticks seems OK, so use these.
+            Note: fps setting is used internally to calculate bit rates, it's not just simply propagated through the pipeline.
+                  Some interlaced content uses one frame per field, av libs report as 50fps. However, decoder seems to internally merge these so the actual output fps is 25fps. For these, should use de-interlacer outputting 1 frame per field, however this is not implemented
+                  at the moment and for this material the pts is OK, but fps is incorrect.
+04-10-2018: Did some tests with various frame rate video: it seems that either the decoder or encoder is detecting the fps, must be from either set pts or picked up from the raw video stream itself. Set the framerate as detected by omx, rather than ffmpeg! Maybe need an option to use ffmpeg detected frame rate?
+05-10-2018: Add option to output one field per frame for interlaced content.

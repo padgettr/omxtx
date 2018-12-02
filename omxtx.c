@@ -179,6 +179,7 @@ static struct context {
    double omxFPS;          /* Output frame rate for display purposes */
    char  *iname;
    char  *oname;
+   char  *oformat;
    AVRational omxtimebase; /* OMX time base is micro seconds */
    OMX_CONFIG_RECTTYPE *cropRect;
    int outputWidth;
@@ -220,10 +221,10 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
    MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
    portdef->nPortIndex = port;
    OERR(OMX_GetParameter(handle, OMX_IndexParamPortDefinition, portdef));
-   printf("%s port %d is %s, %s\n", mapComponent(&ctx, handle), portdef->nPortIndex,
+   fprintf(stderr, "%s port %d is %s, %s\n", mapComponent(&ctx, handle), portdef->nPortIndex,
       (portdef->eDir == 0 ? "input" : "output"),
       (portdef->bEnabled == 0 ? "disabled" : "enabled"));
-   printf("Wants %d bufs, needs %d, size %d, enabled: %d, pop: %d, aligned %d\n",
+   fprintf(stderr, "Wants %d bufs, needs %d, size %d, enabled: %d, pop: %d, aligned %d\n",
       portdef->nBufferCountActual,
       portdef->nBufferCountMin, portdef->nBufferSize,
       portdef->bEnabled, portdef->bPopulated,
@@ -231,7 +232,7 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
 
    switch (portdef->eDomain) {
    case OMX_PortDomainVideo:
-      printf("Video type is currently:\n"
+      fprintf(stderr, "Video type is currently:\n"
          "\tMIME:\t\t%s\n"
          "\tNative:\t\t%p\n"
          "\tWidth:\t\t%d\n"
@@ -258,7 +259,7 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
          portdef->format.video.eColorFormat);
       break;
    case OMX_PortDomainImage:
-      printf("Image type is currently:\n"
+      fprintf(stderr, "Image type is currently:\n"
          "\tMIME:\t\t%s\n"
          "\tNative:\t\t%p\n"
          "\tWidth:\t\t%d\n"
@@ -280,7 +281,7 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
       break;
 /* Feel free to add others. */
    default:
-      fprintf(stderr,"This port is not defined in this program!\n");
+      fprintf(stderr, "This port is not defined in this program!\n");
       break;
    }
    free(portdef);
@@ -368,7 +369,7 @@ static void cleanup(struct context *ctx) {
 static void exitHandler(void) {
    enum OMX_STATETYPE state;
 
-   printf("\n\nIn exit handler, after %lli frames:\n", ctx.framesOut);
+   fprintf(stderr, "\n\nIn exit handler, after %lli frames:\n", ctx.framesOut);
    if (ctx.userFlags & UFLAGS_VERBOSE) {
       dumpport(ctx.dec, PORT_DEC);
       dumpport(ctx.dec, PORT_DEC+1);
@@ -376,14 +377,14 @@ static void exitHandler(void) {
    }
 
    OMX_GetState(ctx.dec, &state);
-   printf("Decoder state: %d\n", state);
+   fprintf(stderr, "Decoder state: %d\n", state);
    OMX_GetState(ctx.enc, &state);
-   printf("Encoder state: %d\n", state);
+   fprintf(stderr, "Encoder state: %d\n", state);
    cleanup(&ctx);
 }
 
 static int mapCodec(enum AVCodecID id) {
-   printf("Mapping codec ID %d (%x)\n", id, id);
+   fprintf(stderr, "Mapping codec ID %d (%x)\n", id, id);
    switch (id) {
       case AV_CODEC_ID_MPEG2VIDEO:
          return OMX_VIDEO_CodingMPEG2;
@@ -401,7 +402,7 @@ static int mapCodec(enum AVCodecID id) {
 }
 
 static int mapProfile(enum OMX_VIDEO_AVCPROFILETYPE id) {
-   printf("Mapping profile ID %d (%x)\n", id, id);
+   fprintf(stderr, "Mapping profile ID %d (%x)\n", id, id);
    switch (id) {
       case OMX_VIDEO_AVCProfileBaseline:
          return FF_PROFILE_H264_BASELINE;
@@ -425,7 +426,7 @@ static int mapProfile(enum OMX_VIDEO_AVCPROFILETYPE id) {
 }
 
 static int mapLevel(enum OMX_VIDEO_AVCLEVELTYPE id) {
-   printf("Mapping level ID %d (%x)\n", id, id);
+   fprintf(stderr, "Mapping level ID %d (%x)\n", id, id);
    switch (id) {
       case OMX_VIDEO_AVCLevel1:
          return 10;
@@ -465,7 +466,7 @@ static int mapLevel(enum OMX_VIDEO_AVCLEVELTYPE id) {
 }
 
 static int mapColour(enum OMX_COLOR_FORMATTYPE id) {
-   printf("Mapping colour ID %d (%x)\n", id, id);
+   fprintf(stderr, "Mapping colour ID %d (%x)\n", id, id);
    switch (id) {
       case OMX_COLOR_FormatYUV420PackedPlanar:
          return AV_PIX_FMT_YUV420P;
@@ -543,11 +544,16 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
    const OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
    AVFormatContext   *oc=NULL;
    AVStream          *iflow, *oflow;
+   AVOutputFormat    *fmt;
 
    viddef = &prt->format.video; /* Decoder output format structure */
 
    /* allocate avformat context - avformat_free_context() can be used to free */
-   avformat_alloc_output_context2(&oc, NULL, NULL, oname);
+
+   if (ctx.oformat!=NULL)
+      fmt = av_guess_format(ctx.oformat, NULL, NULL);
+
+   avformat_alloc_output_context2(&oc, fmt, NULL, oname);
    if (!oc) {
       fprintf(stderr, "Failed to alloc outputcontext\n");
       exit(1);
@@ -597,10 +603,10 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       oflow->sample_aspect_ratio.den = iflow->codecpar->sample_aspect_ratio.den;
    }
 
-   printf("\n\n\n");
+   fprintf(stderr, "\n\n\n");
    if (ctx.inAudioStreamIdx>0) {
-      printf("*** Mapping input video stream #%i to output video stream #%i ***\n", ctx.inVidStreamIdx, 0);
-      printf("*** Mapping input audio stream #%i to output audio stream #%i ***\n\n", ctx.inAudioStreamIdx, 1);
+      fprintf(stderr, "*** Mapping input video stream #%i to output video stream #%i ***\n", ctx.inVidStreamIdx, 0);
+      fprintf(stderr, "*** Mapping input audio stream #%i to output audio stream #%i ***\n\n", ctx.inAudioStreamIdx, 1);
       iflow = ic->streams[ctx.inAudioStreamIdx];
       oflow = avformat_new_stream(oc, NULL); /* Stream 1 */
       if (avcodec_parameters_copy(oflow->codecpar, iflow->codecpar) < 0) /* This copies extradata */
@@ -610,7 +616,7 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       oflow->time_base = iflow->time_base; /* Time base hint */
    }
 
-   printf("\nOutput:\n");
+   fprintf(stderr, "\nOutput:\n");
    av_dump_format(oc, 0, oname, 1);
 
    return oc;
@@ -644,7 +650,7 @@ static int openOutput(struct context *ctx) {
    int i, ret;
    struct packetentry *packet, *next;
 
-   printf("Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
+   fprintf(stderr,"Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
 
    if (!(ctx->oc->oformat->flags & AVFMT_NOFILE)) {
      ret = avio_open(&ctx->oc->pb, ctx->oname, AVIO_FLAG_WRITE);
@@ -661,7 +667,7 @@ static int openOutput(struct context *ctx) {
    }
 
    if (ctx->inAudioStreamIdx>0) {
-      printf("Writing saved audio packets out...");
+      fprintf(stderr, "Writing saved audio packets out...");
       for (i = 0, packet = TAILQ_FIRST(&packetq); packet; packet = next) {
          next = TAILQ_NEXT(packet, link);
          writeAudioPacket(packet->packet);
@@ -670,17 +676,17 @@ static int openOutput(struct context *ctx) {
          av_packet_free(&packet->packet);
       }
 
-      printf("done.  Wrote %d frames.\n\n", i);
+      fprintf(stderr, "done.  Wrote %d frames.\n\n", i);
    }
 
-   printf("Press ctrl-c to abort\n");
+   fprintf(stderr, "Press ctrl-c to abort\n");
    return 0;
 }
 
 OMX_ERRORTYPE genericEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
 
    if (ctx->userFlags & UFLAGS_VERBOSE) {
-      printf("Got an unhandled event of type %s (%x) on %s (d1: %x, d2: %x)\n",
+      fprintf(stderr, "Got an unhandled event of type %s (%x) on %s (d1: %x, d2: %x)\n",
          mapEvents(event), event, mapComponent(ctx, handle), data1, data2);
    }
    return OMX_ErrorNone;
@@ -794,13 +800,13 @@ OMX_ERRORTYPE vidEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
 }
 
 OMX_ERRORTYPE genericBufferCallback(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADERTYPE *buf) {
-   printf("Got a buffer event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
+   fprintf(stderr, "Got a buffer event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE emptied(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADERTYPE *buf) {
    #ifdef DEBUG
-      printf("Got a buffer emptied event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
+      fprintf(stderr, "Got a buffer emptied event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    #endif
    pthread_mutex_lock(&ctx->decBufLock);
    buf->nFilledLen = 0; /* Flag buffer emptied */
@@ -814,7 +820,7 @@ OMX_ERRORTYPE emptied(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEAD
  */
 OMX_ERRORTYPE filled(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADERTYPE *buf) {
    #ifdef DEBUG
-      printf("Got a buffer filled event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
+      fprintf(stderr, "Got a buffer filled event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    #endif
    ctx->encBufferFilled=1;
    return OMX_ErrorNone;
@@ -862,11 +868,11 @@ static void *fps(void *p) {
    while (ctx.state!=DECEOF) {
       lastframe = ctx.framesOut;
       if (sleep(1)>0) break;
-      printf("Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims     \r",
+      fprintf(stderr, "Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims     \r",
          ctx.framesOut, (double)ctx.framesOut/ctx.omxFPS, ctx.framesOut-lastframe, ctx.ptsDelta);
-      fflush(stdout);
+      fflush(stderr);
    }
-   printf("\n");
+   fprintf(stderr, "\n");
    return NULL;
 }
 
@@ -883,7 +889,7 @@ static OMX_BUFFERHEADERTYPE *allocbufs(OMX_HANDLETYPE h, int port) {
    portdef->nPortIndex = port;
    OERR(OMX_GetParameter(h, OMX_IndexParamPortDefinition, portdef));
 
-   printf("Allocate %i %s buffers of %d bytes\n", portdef->nBufferCountActual, mapComponent(&ctx, h), portdef->nBufferSize);
+   fprintf(stderr, "Allocate %i %s buffers of %d bytes\n", portdef->nBufferCountActual, mapComponent(&ctx, h), portdef->nBufferSize);
    for (i = 0; i < portdef->nBufferCountActual; i++) {
       //OMX_U8 *buf= vcos_malloc_aligned(portdef->nBufferSize, portdef->nBufferAlignment, "buffer");
       //OERR(OMX_UseBuffer(h, end, port, NULL, portdef->nBufferSize, buf));
@@ -1136,26 +1142,26 @@ static void configure(struct context *ctx) {
    ctx->interlaceMode=interlaceType->eMode;
    switch (ctx->interlaceMode) {
       case OMX_InterlaceProgressive: /* mode 0: no need for de-interlacer */
-         printf("Progresive scan detected, de-interlacing not required.\n", ctx->interlaceMode);
+         fprintf(stderr, "Progresive scan detected, de-interlacing not required.\n", ctx->interlaceMode);
          if (ctx->userFlags & UFLAGS_DEINTERLACE)
             ctx->userFlags ^= UFLAGS_DEINTERLACE;
       break;
       case OMX_InterlaceFieldSingleUpperFirst:   /* mode 1: The data is interlaced, fields sent separately in temporal order, with upper field first */
       case OMX_InterlaceFieldSingleLowerFirst:   /* mode 2: The data is interlaced, fields sent separately in temporal order, with lower field first */
-         printf("Unsupported interlace format %i detected (separate field per frame).\n", ctx->interlaceMode);
+         fprintf(stderr, "Unsupported interlace format %i detected (separate field per frame).\n", ctx->interlaceMode);
          if (ctx->userFlags & UFLAGS_DEINTERLACE) {
-            printf("Disabling deinterlacer.\n");
+            fprintf(stderr, "Disabling deinterlacer.\n");
             ctx->userFlags ^= UFLAGS_DEINTERLACE;
          }
       break;
       default:
-         printf("*** Source material is interlaced! Interlace type: %i ***\n", interlaceType->eMode);
-         printf("*** Consider using the de-interlacer option -d ***\n");
+         fprintf(stderr, "*** Source material is interlaced! Interlace type: %i ***\n", interlaceType->eMode);
+         fprintf(stderr, "*** Consider using the de-interlacer option -d ***\n");
          // TODO: Switch on interlacer automatically? If so, will need to consider carefully the frame rate: if input is interlaced and 50fps, but omx detects 25fps, it's probably one field per frame and should output with one field per frame.
       break;
    }
 
-   printf("Setting up encoder.\n");
+   fprintf(stderr, "Setting up encoder.\n");
 
    /* Get the decoder OUTPUT port state */
    portdef->nPortIndex = PORT_DEC+1;
@@ -1405,7 +1411,7 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
       else if (*(ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->extradata)!=1) ctx->naluInputFormat=1; // omxplayer: valid avcC atom data always starts with the value 1 (version), otherwise annexb
       else ctx->naluInputFormat=0;
       if (ctx->naluInputFormat==1) {
-         printf("** h264 annexb format detected\n");
+         fprintf(stderr, "** h264 annexb format detected\n");
          MAKEME(nalStreamFormat, OMX_NALSTREAMFORMATTYPE);
 
          nalStreamFormat->nPortIndex = PORT_DEC;
@@ -1442,6 +1448,7 @@ static void usage(const char *name) {
       "   -c C  Crop: 'C' is specified in pixels as width:height:left:top\n"
       "   -d[0] Deinterlace: default is to output one frame per two interlaced fields\n"
       "         If 0 is specified, one frame per field will be output.\n"
+      "   -f F  Format: 'F' overrides format else guessed from the file name, usefull if decoding to stdout\n"
       "   -i n  Select audio stream n.\n"
       "   -m    Monitor.  Display the decoder's output\n"
       "   -p    Make up pts based on encoder (constant) framerate. Default is based on input stream dts.\n"
@@ -1610,7 +1617,7 @@ static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
    ctx->maxQuant=0;              /* Default maximum quantisation: use 0 avoid resetting from firmware default (50?)*/
    ctx->dei_ofpf=1;              /* Deinterlace: set to 0 for one frame per two fields; set to 1 to use one frame per field */
 
-   while ((opt = getopt(argc, argv, "a::b:c:d:i:mpq:r:v")) != -1) {
+   while ((opt = getopt(argc, argv, "a::b:c:d:f:i:mpq:r:v")) != -1) {
       switch (opt) {
       case 'a':
          ctx->userFlags |= UFLAGS_AUTO_SCALE_X;
@@ -1633,6 +1640,10 @@ static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
          ctx->userFlags |= UFLAGS_DEINTERLACE;
          if (optarg!=NULL && *optarg=='0')
             ctx->dei_ofpf=0;
+      break;
+      case 'f':
+         if (optarg!=NULL)
+            ctx->oformat = optarg;
       break;
       case 'i':
          ctx->userAudioStreamIdx=atoi(optarg);
@@ -1709,7 +1720,7 @@ static int openInputFile(struct context *ctx) {
    }
    ctx->ic=ic;
 
-   printf("Input:\n");
+   fprintf(stderr, "Input:\n");
    av_dump_format(ic, 0, ctx->iname, 0);
 
    return ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id;   /* Return the codec ID for the video stream */
@@ -1739,7 +1750,7 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
    pkt.pts=av_rescale_q(ctx->nalEntry.pts, ctx->omxtimebase, ctx->oc->streams[0]->time_base); /* Transform omx pts to output timebase */
    pkt.dts=pkt.pts; /* Out of order b-frames not supported on rpi: so dts=pts */
    ctx->ptsDelta=(ctx->nalEntry.pts-ctx->nalEntry.tick)/1000;
-   //printf("pts:%lld, tick:%lld\n", ctx->nalEntry.pts, ctx->nalEntry.tick);
+   //fprintf(stderr, "pts:%lld, tick:%lld\n", ctx->nalEntry.pts, ctx->nalEntry.tick);
 
    if (nalType==5)   /* This is an IDR frame */
       pkt.flags |= AV_PKT_FLAG_KEY;
@@ -1780,7 +1791,7 @@ static void emptyEncoderBuffers(struct context *ctx) {
    }
    else {
       if (ctx->state==OPENOUTPUT && (ctx->encbufs->nFlags & OMX_BUFFERFLAG_CODECCONFIG)) {
-         printf("Examining extradata...\n");
+         fprintf(stderr, "Examining extradata...\n");
          /* This code was copied from ffmpeg */
          if (av_reallocp(&ctx->oc->streams[0]->codecpar->extradata, ctx->oc->streams[0]->codecpar->extradata_size + ctx->encbufs->nFilledLen + AV_INPUT_BUFFER_PADDING_SIZE) == 0) {
             memcpy(ctx->oc->streams[0]->codecpar->extradata + ctx->oc->streams[0]->codecpar->extradata_size, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
@@ -1983,7 +1994,7 @@ int main(int argc, char *argv[]) {
    /* If there is extradata send it to the decoder to have a look at */
    if (ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata!=NULL
          && ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size>0) {
-      printf("** Found extradata in video stream...\n");
+      fprintf(stderr, "** Found extradata in video stream...\n");
       spare=ctx.decbufs;
       if (ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size < spare->nAllocLen) {
          spare->nFilledLen=ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size;
@@ -2019,11 +2030,11 @@ int main(int argc, char *argv[]) {
          exit(1);
          break;
       case TUNNELSETUP:
-         printf("Identified the parameters after %d video frames.\n", j);
+         fprintf(stderr, "Identified the parameters after %d video frames.\n", j);
          start = time(NULL);
          configure(&ctx);
   
-         printf("OMX detected %lf fps\n", ctx.omxFPS);
+         fprintf(stderr, "OMX detected %lf fps\n", ctx.omxFPS);
          pthread_attr_init(&fpsa);
          pthread_attr_setdetachstate(&fpsa, PTHREAD_CREATE_DETACHED);
          pthread_create(&fpst, &fpsa, fps, NULL); /* Run fps calculator in another thread */
@@ -2059,9 +2070,9 @@ int main(int argc, char *argv[]) {
    
    end = time(NULL);
 
-   printf("\nDropped frames: %f\%\n",100*(ctx.framesIn-ctx.framesOut)/ctx.framesIn);
-   printf("Processed %lli frames in %d seconds; %llif/s\n\n\n", ctx.framesOut, end-start, (ctx.framesOut/(end-start)));
-   printf("Time waiting for encoder to finish: %.2lfs\n",(double)ctx.encWaitTime*1E-5);
+   fprintf(stderr, "\nDropped frames: %f\%\n",100*(ctx.framesIn-ctx.framesOut)/ctx.framesIn);
+   fprintf(stderr, "Processed %lli frames in %d seconds; %llif/s\n\n\n", ctx.framesOut, end-start, (ctx.framesOut/(end-start)));
+   fprintf(stderr, "Time waiting for encoder to finish: %.2lfs\n",(double)ctx.encWaitTime*1E-5);
    
    if (ctx.oc) {
       av_write_trailer(ctx.oc);

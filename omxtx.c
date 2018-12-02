@@ -1682,7 +1682,7 @@ static int openInputFile(struct context *ctx) {
    AVFormatContext *ic=NULL;   /* Input context */
    int err;
 
-   //av_register_all();
+   av_register_all();
 
    if ((err = avformat_open_input(&ic, ctx->iname, NULL, NULL) != 0)) {
       fprintf(stderr, "Failed to open '%s': %s\n", ctx->iname, strerror(err));

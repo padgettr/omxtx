@@ -13,10 +13,11 @@
  * Usage: type ./omxtx after make for usage / options
  *
  * This version has been substantially changed to add new functionality, and
- * compatibility with ffmpeg >= 3.2.2
+ * compatibility with ffmpeg >= 4.0
+ * For ffmpeg 3.x please set CFLAGS+=-DFFMPEG_LE_4 to enable all formats.
  * 
  *
- * Dr. R. Padgett <rod_padgett@hotmail.com> May 2016
+ * Dr. R. Padgett <rod_padgett@hotmail.com> January 2019
  *
  *
  *
@@ -188,6 +189,7 @@ static struct context {
    int maxQuant;           /* Maximum allowed quantisation */
    int interlaceMode;
    int dei_ofpf;           /* Deinterlacer: output 1 frame per field */
+   const char *formatName; /* Output container format name; may be NULL if specified by filename extension */
 } ctx;
 
 /* Command line option flags */
@@ -220,10 +222,10 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
    MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
    portdef->nPortIndex = port;
    OERR(OMX_GetParameter(handle, OMX_IndexParamPortDefinition, portdef));
-   printf("%s port %d is %s, %s\n", mapComponent(&ctx, handle), portdef->nPortIndex,
+   fprintf(stderr, "%s port %d is %s, %s\n", mapComponent(&ctx, handle), portdef->nPortIndex,
       (portdef->eDir == 0 ? "input" : "output"),
       (portdef->bEnabled == 0 ? "disabled" : "enabled"));
-   printf("Wants %d bufs, needs %d, size %d, enabled: %d, pop: %d, aligned %d\n",
+   fprintf(stderr, "Wants %d bufs, needs %d, size %d, enabled: %d, pop: %d, aligned %d\n",
       portdef->nBufferCountActual,
       portdef->nBufferCountMin, portdef->nBufferSize,
       portdef->bEnabled, portdef->bPopulated,
@@ -231,7 +233,7 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
 
    switch (portdef->eDomain) {
    case OMX_PortDomainVideo:
-      printf("Video type is currently:\n"
+      fprintf(stderr, "Video type is currently:\n"
          "\tMIME:\t\t%s\n"
          "\tNative:\t\t%p\n"
          "\tWidth:\t\t%d\n"
@@ -258,7 +260,7 @@ static void dumpport(OMX_HANDLETYPE handle, int port) {
          portdef->format.video.eColorFormat);
       break;
    case OMX_PortDomainImage:
-      printf("Image type is currently:\n"
+      fprintf(stderr, "Image type is currently:\n"
          "\tMIME:\t\t%s\n"
          "\tNative:\t\t%p\n"
          "\tWidth:\t\t%d\n"
@@ -368,22 +370,24 @@ static void cleanup(struct context *ctx) {
 static void exitHandler(void) {
    enum OMX_STATETYPE state;
 
-   printf("\n\nIn exit handler, after %lli frames:\n", ctx.framesOut);
    if (ctx.userFlags & UFLAGS_VERBOSE) {
+      fprintf(stderr, "In exit handler, after %lli frames:\n", ctx.framesOut);
       dumpport(ctx.dec, PORT_DEC);
       dumpport(ctx.dec, PORT_DEC+1);
       dumpport(ctx.enc, PORT_ENC+1);
-   }
 
-   OMX_GetState(ctx.dec, &state);
-   printf("Decoder state: %d\n", state);
-   OMX_GetState(ctx.enc, &state);
-   printf("Encoder state: %d\n", state);
+      OMX_GetState(ctx.dec, &state);
+      fprintf(stderr, "Decoder state: %d\n", state);
+      OMX_GetState(ctx.enc, &state);
+      fprintf(stderr, "Encoder state: %d\n", state);
+      fprintf(stderr, "********** Starting teardown **********\n");
+   }
    cleanup(&ctx);
 }
 
 static int mapCodec(enum AVCodecID id) {
-   printf("Mapping codec ID %d (%x)\n", id, id);
+   if (ctx.userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Mapping codec ID %d (%x)\n", id, id);
    switch (id) {
       case AV_CODEC_ID_MPEG2VIDEO:
          return OMX_VIDEO_CodingMPEG2;
@@ -401,7 +405,8 @@ static int mapCodec(enum AVCodecID id) {
 }
 
 static int mapProfile(enum OMX_VIDEO_AVCPROFILETYPE id) {
-   printf("Mapping profile ID %d (%x)\n", id, id);
+   if (ctx.userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Mapping profile ID %d (%x)\n", id, id);
    switch (id) {
       case OMX_VIDEO_AVCProfileBaseline:
          return FF_PROFILE_H264_BASELINE;
@@ -425,7 +430,8 @@ static int mapProfile(enum OMX_VIDEO_AVCPROFILETYPE id) {
 }
 
 static int mapLevel(enum OMX_VIDEO_AVCLEVELTYPE id) {
-   printf("Mapping level ID %d (%x)\n", id, id);
+   if (ctx.userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Mapping level ID %d (%x)\n", id, id);
    switch (id) {
       case OMX_VIDEO_AVCLevel1:
          return 10;
@@ -465,7 +471,8 @@ static int mapLevel(enum OMX_VIDEO_AVCLEVELTYPE id) {
 }
 
 static int mapColour(enum OMX_COLOR_FORMATTYPE id) {
-   printf("Mapping colour ID %d (%x)\n", id, id);
+   if (ctx.userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Mapping colour ID %d (%x)\n", id, id);
    switch (id) {
       case OMX_COLOR_FormatYUV420PackedPlanar:
          return AV_PIX_FMT_YUV420P;
@@ -547,7 +554,11 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
    viddef = &prt->format.video; /* Decoder output format structure */
 
    /* allocate avformat context - avformat_free_context() can be used to free */
-   avformat_alloc_output_context2(&oc, NULL, NULL, oname);
+   if (ctx.formatName == NULL)
+      avformat_alloc_output_context2(&oc, NULL, NULL, oname);
+   else
+      avformat_alloc_output_context2(&oc, NULL, ctx.formatName, NULL);
+
    if (!oc) {
       fprintf(stderr, "Failed to alloc outputcontext\n");
       exit(1);
@@ -597,10 +608,9 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       oflow->sample_aspect_ratio.den = iflow->codecpar->sample_aspect_ratio.den;
    }
 
-   printf("\n\n\n");
+   fprintf(stderr, "*** Mapping input video stream #%i to output video stream #%i ***\n", ctx.inVidStreamIdx, 0);
    if (ctx.inAudioStreamIdx>0) {
-      printf("*** Mapping input video stream #%i to output video stream #%i ***\n", ctx.inVidStreamIdx, 0);
-      printf("*** Mapping input audio stream #%i to output audio stream #%i ***\n\n", ctx.inAudioStreamIdx, 1);
+      fprintf(stderr, "*** Mapping input audio stream #%i to output audio stream #%i ***\n", ctx.inAudioStreamIdx, 1);
       iflow = ic->streams[ctx.inAudioStreamIdx];
       oflow = avformat_new_stream(oc, NULL); /* Stream 1 */
       if (avcodec_parameters_copy(oflow->codecpar, iflow->codecpar) < 0) /* This copies extradata */
@@ -609,10 +619,9 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       oflow->start_time=0;
       oflow->time_base = iflow->time_base; /* Time base hint */
    }
-
-   printf("\nOutput:\n");
+   /* Show output format info */
+   fprintf(stderr,"\n");
    av_dump_format(oc, 0, oname, 1);
-
    return oc;
 }
 
@@ -644,12 +653,13 @@ static int openOutput(struct context *ctx) {
    int i, ret;
    struct packetentry *packet, *next;
 
-   printf("Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
+   if (ctx->userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Got SPS and PPS data: opening output file '%s'\n", ctx->oname);
 
    if (!(ctx->oc->oformat->flags & AVFMT_NOFILE)) {
      ret = avio_open(&ctx->oc->pb, ctx->oname, AVIO_FLAG_WRITE);
      if (ret < 0) {
-         fprintf(stderr, "Could not open output file '%s'\n", ctx->oname);
+         fprintf(stderr, "ERROR: Could not open output file '%s'\n", ctx->oname);
          exit(1);
      }
    }
@@ -661,7 +671,6 @@ static int openOutput(struct context *ctx) {
    }
 
    if (ctx->inAudioStreamIdx>0) {
-      printf("Writing saved audio packets out...");
       for (i = 0, packet = TAILQ_FIRST(&packetq); packet; packet = next) {
          next = TAILQ_NEXT(packet, link);
          writeAudioPacket(packet->packet);
@@ -669,18 +678,18 @@ static int openOutput(struct context *ctx) {
          TAILQ_REMOVE(&packetq, packet, link);
          av_packet_free(&packet->packet);
       }
-
-      printf("done.  Wrote %d frames.\n\n", i);
+      if (ctx->userFlags & UFLAGS_VERBOSE)
+         fprintf(stderr, "Wrote %d saved frames saved during OMX init.\n", i);
    }
 
-   printf("Press ctrl-c to abort\n");
+   fprintf(stderr, "\n*** Press ctrl-c to abort ***\n\n");
    return 0;
 }
 
 OMX_ERRORTYPE genericEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2, OMX_PTR eventdata) {
 
    if (ctx->userFlags & UFLAGS_VERBOSE) {
-      printf("Got an unhandled event of type %s (%x) on %s (d1: %x, d2: %x)\n",
+      fprintf(stderr, "WARNING: Got an unhandled event of type %s (%x) on %s (d1: %x, d2: %x)\n",
          mapEvents(event), event, mapComponent(ctx, handle), data1, data2);
    }
    return OMX_ErrorNone;
@@ -794,13 +803,13 @@ OMX_ERRORTYPE vidEventHandler(OMX_HANDLETYPE handle, struct context *ctx, OMX_EV
 }
 
 OMX_ERRORTYPE genericBufferCallback(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADERTYPE *buf) {
-   printf("Got a buffer event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
+   fprintf(stderr, "WARNING: Got an unhandled buffer event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    return OMX_ErrorNone;
 }
 
 OMX_ERRORTYPE emptied(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADERTYPE *buf) {
    #ifdef DEBUG
-      printf("Got a buffer emptied event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
+      fprintf(stderr, "*** DEBUG *** Got a buffer emptied event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    #endif
    pthread_mutex_lock(&ctx->decBufLock);
    buf->nFilledLen = 0; /* Flag buffer emptied */
@@ -814,7 +823,7 @@ OMX_ERRORTYPE emptied(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEAD
  */
 OMX_ERRORTYPE filled(OMX_HANDLETYPE handle, struct context *ctx, OMX_BUFFERHEADERTYPE *buf) {
    #ifdef DEBUG
-      printf("Got a buffer filled event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
+      fprintf(stderr, "*** DEBUG *** Got a buffer filled event on %s %p, buf %p\n", mapComponent(ctx, handle), handle, buf);
    #endif
    ctx->encBufferFilled=1;
    return OMX_ErrorNone;
@@ -862,11 +871,11 @@ static void *fps(void *p) {
    while (ctx.state!=DECEOF) {
       lastframe = ctx.framesOut;
       if (sleep(1)>0) break;
-      printf("Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims     \r",
+      fprintf(stderr, "Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims     \r",
          ctx.framesOut, (double)ctx.framesOut/ctx.omxFPS, ctx.framesOut-lastframe, ctx.ptsDelta);
-      fflush(stdout);
+      fflush(stderr);
    }
-   printf("\n");
+   fprintf(stderr, "\n");
    return NULL;
 }
 
@@ -883,7 +892,8 @@ static OMX_BUFFERHEADERTYPE *allocbufs(OMX_HANDLETYPE h, int port) {
    portdef->nPortIndex = port;
    OERR(OMX_GetParameter(h, OMX_IndexParamPortDefinition, portdef));
 
-   printf("Allocate %i %s buffers of %d bytes\n", portdef->nBufferCountActual, mapComponent(&ctx, h), portdef->nBufferSize);
+   if (ctx.userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Allocate %i %s buffers of %d bytes\n", portdef->nBufferCountActual, mapComponent(&ctx, h), portdef->nBufferSize);
    for (i = 0; i < portdef->nBufferCountActual; i++) {
       //OMX_U8 *buf= vcos_malloc_aligned(portdef->nBufferSize, portdef->nBufferAlignment, "buffer");
       //OERR(OMX_UseBuffer(h, end, port, NULL, portdef->nBufferSize, buf));
@@ -911,9 +921,8 @@ static void requestStateChange(OMX_HANDLETYPE handle, enum OMX_STATETYPE rState,
          usleep(100);
          OMX_GetState(handle, &aState);
          i++;
-         fprintf(stderr, "State %s =%i\r", mapComponent(&ctx, handle), aState);
       } while (i<10000 && aState!=rState);   /* Timeout 1s */
-      fprintf(stderr, "\n");
+
       if (aState!=rState) {
          fprintf(stderr,"ERROR: timeout waiting for state change: wanted %i, got %i\n",rState, aState);
          exit(1);
@@ -1136,26 +1145,27 @@ static void configure(struct context *ctx) {
    ctx->interlaceMode=interlaceType->eMode;
    switch (ctx->interlaceMode) {
       case OMX_InterlaceProgressive: /* mode 0: no need for de-interlacer */
-         printf("Progresive scan detected, de-interlacing not required.\n", ctx->interlaceMode);
+         fprintf(stderr, "INFO: Progresive scan detected, de-interlacing not required.\n", ctx->interlaceMode);
          if (ctx->userFlags & UFLAGS_DEINTERLACE)
             ctx->userFlags ^= UFLAGS_DEINTERLACE;
       break;
       case OMX_InterlaceFieldSingleUpperFirst:   /* mode 1: The data is interlaced, fields sent separately in temporal order, with upper field first */
       case OMX_InterlaceFieldSingleLowerFirst:   /* mode 2: The data is interlaced, fields sent separately in temporal order, with lower field first */
-         printf("Unsupported interlace format %i detected (separate field per frame).\n", ctx->interlaceMode);
+         fprintf(stderr, "WARNING: Unsupported interlace format %i detected (separate field per frame).\n", ctx->interlaceMode);
          if (ctx->userFlags & UFLAGS_DEINTERLACE) {
-            printf("Disabling deinterlacer.\n");
+            fprintf(stderr, "WARNING: Disabling deinterlacer.\n");
             ctx->userFlags ^= UFLAGS_DEINTERLACE;
          }
       break;
       default:
-         printf("*** Source material is interlaced! Interlace type: %i ***\n", interlaceType->eMode);
-         printf("*** Consider using the de-interlacer option -d ***\n");
+         fprintf(stderr, "WARNING: *** Source material is interlaced! Interlace type: %i ***\n", interlaceType->eMode);
+         fprintf(stderr, "WARNING: *** Consider using the de-interlacer option -d ***\n");
          // TODO: Switch on interlacer automatically? If so, will need to consider carefully the frame rate: if input is interlaced and 50fps, but omx detects 25fps, it's probably one field per frame and should output with one field per frame.
       break;
    }
 
-   printf("Setting up encoder.\n");
+   if (ctx->userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Setting up encoder.\n");
 
    /* Get the decoder OUTPUT port state */
    portdef->nPortIndex = PORT_DEC+1;
@@ -1369,7 +1379,7 @@ static void configure(struct context *ctx) {
    if ((ctx->userFlags & UFLAGS_RAW) == 0) {
       ctx->oc = makeOutputContext(ctx->ic, ctx->oname, ctx->inVidStreamIdx, portdef, level);
       if (!ctx->oc) {
-         fprintf(stderr, "Create output AVFormatContext failed.\n");
+         fprintf(stderr, "ERROR: Create output AVFormatContext failed.\n");
          exit(1);
       }
    }
@@ -1405,7 +1415,7 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
       else if (*(ctx->ic->streams[ctx->inVidStreamIdx]->codecpar->extradata)!=1) ctx->naluInputFormat=1; // omxplayer: valid avcC atom data always starts with the value 1 (version), otherwise annexb
       else ctx->naluInputFormat=0;
       if (ctx->naluInputFormat==1) {
-         printf("** h264 annexb format detected\n");
+         fprintf(stderr, "WARNING: ** h264 annexb format detected: TODO!\n");
          MAKEME(nalStreamFormat, OMX_NALSTREAMFORMATTYPE);
 
          nalStreamFormat->nPortIndex = PORT_DEC;
@@ -1431,33 +1441,37 @@ static OMX_BUFFERHEADERTYPE *configDecoder(struct context *ctx) {
 }
 
 static void usage(const char *name) {
-   fprintf(stderr, "Usage: %s [opts] <infile> <outfile>\n\n"
+   fprintf(stdout, "Usage: %s <infile> [opts] -o <outfile>\n\n"
       "Where opts are:\n"
       "   -a[y] Auto scale the video stream to produce a sample aspect ratio (pixel aspect ratio)\n"
-      "         of 1:1. By default the scaling is in the x-direction (image width); this usually\n"
-      "         results in more (interpolated) pixels in the x-direction. If y is specified, the scaling\n"
-      "         is done in the y-direction; this usually results in a reduction in resolution in the\n"
-      "         y-direction.\n"
+      "         of 1:1. By default, the scaling is in the x-direction (image width); this usually\n"
+      "         results in more (interpolated) pixels in the x-direction. If 'y' is specified, the\n"
+      "         scaling is done in the y-direction; this usually results in a reduction in resolution\n"
+      "         in the y-direction. Useful for DVD where sample aspect ratio is not 1:1, and the\n"
+      "         playback device doesn't scale the video correctly\n"
       "   -b n  Target bitrate n[k|M] in bits/second (default: 2Mb/s)\n"
       "   -c C  Crop: 'C' is specified in pixels as width:height:left:top\n"
-      "   -d[0] Deinterlace: default is to output one frame per two interlaced fields\n"
-      "         If 0 is specified, one frame per field will be output.\n"
+      "   -d[0] Deinterlace: The default, is to output one frame per two interlaced fields.\n"
+      "         If 0 is specified, one frame per field will be output\n"
+      "   -f    Specify the output container format: see output of 'ffmpeg -formats' for\n"
+      "         a list of supported formats. Defaults to 'matroska' if no format specified.\n"
       "   -i n  Select audio stream n.\n"
       "   -m    Monitor.  Display the decoder's output\n"
-      "   -p    Make up pts based on encoder (constant) framerate. Default is based on input stream dts.\n"
+      "   -o O  Output filename with standard container extension, eg. out.mkv\n"
+      "   -p    Make up pts. Default is to use input stream dts.\n"
       "   -q Q  Quantisation limits: 'Q' is specified as min=a:max=b where 0 < a < b < 52.\n"
-      "         Defaults to a=20, b=50.\n"
+      "         Defaults to a=20, b=50 if this option is not used.\n"
       "   -r S  Resize: 'S' is in pixels specified as widthxheight\n"
       "   -v    Verbose: show input / output states of OMX components\n"
       "\n"
-      "Output container is guessed based on filename. Use '.nal' for raw output.\n"
+      "Output container is guessed based on filename extension. Use '.nal' for raw output.\n"
       "\n"
       "Input file must contain one of MPEG2, H.264, MPEG4 (H.263), MJPEG or vp8 video.\n"
       "\n", name);
    exit(1);
 }
 
-static int parsebitrate(const char *s, int defaultRate) {
+static int parsebitrate(const char *s) {
    float rate;
    char specifier;
    int r;
@@ -1465,29 +1479,28 @@ static int parsebitrate(const char *s, int defaultRate) {
    if (s!=NULL) {
       r = sscanf(s, "%f%c", &rate, &specifier);
       switch (r) {
-      case 1:
-         return (int)rate;
-      case 2:
-         switch (specifier) {
-         case 'K':
-         case 'k':
-            return (int)(rate * 1024.0);
-         case 'M':
-         case 'm':
-            return (int)(rate * 1024.0 * 1024.0);
-         default:
-            fprintf(stderr, "Unrecognised bitrate specifier!\n");
-            exit(1);
+         case 1:
+            return (int)rate;
+         case 2:
+            switch (specifier) {
+               case 'K':
+               case 'k':
+                  return (int)(rate * 1024.0);
+               case 'M':
+               case 'm':
+                  return (int)(rate * 1024.0 * 1024.0);
+               default:
+                  fprintf(stderr, "WARNING: Unrecognised bitrate specifier.\n");
+               break;
+            }
             break;
-         }
-         break;
-      default:
-         fprintf(stderr, "Failed to parse bitrate!\n");
-         exit(1);
+         default:
+            fprintf(stderr, "WARNING: Unknown bitrate format.\n");
          break;
       }
    }
-   return defaultRate;
+   fprintf(stderr, "ERROR: Failed to parse bitrate!\n");
+   return -1;
 }
 
 /* If the encoder isn't running, save any audio packets for remux after the output file has been opened.
@@ -1527,11 +1540,11 @@ static AVPacket *getNextVideoPacket(struct context *ctx) {
    return pkt;
 }
 
-static int setCropRectangle(struct context *ctx, const char *optarg) {
+static int setCropRectangle(struct context *ctx, const char *optArg) {
    int cropLeft, cropTop, cropWidth, cropHeight;
 
-   if (optarg!=NULL) {
-      if (sscanf(optarg, "%d:%d:%d:%d", &cropWidth, &cropHeight, &cropLeft, &cropTop) == 4) {
+   if (optArg!=NULL) {
+      if (sscanf(optArg, "%d:%d:%d:%d", &cropWidth, &cropHeight, &cropLeft, &cropTop) == 4) {
          cropTop += 0x04;  /* Interlaced material requires y offset is a multiple of 4 */ 
          cropTop &= ~0x04;
          cropWidth += 0x0f;
@@ -1553,11 +1566,11 @@ static int setCropRectangle(struct context *ctx, const char *optarg) {
    return 1;
 }
 
-static int setOutputSize(struct context *ctx, const char *optarg) {
+static int setOutputSize(struct context *ctx, const char *optArg) {
    int outputWidth, outputHeight;
 
-   if (optarg!=NULL) {
-      if (sscanf(optarg, "%dx%d", &outputWidth, &outputHeight) == 2) {
+   if (optArg!=NULL) {
+      if (sscanf(optArg, "%dx%d", &outputWidth, &outputHeight) == 2) {
          outputWidth += 0x0f; /* round x up to next multiple of 16; if already a multiple of 16, x is unchanged */
          outputWidth &= ~0x0f;
          outputHeight += 0x0f; /* round y up to next multiple of 16 */
@@ -1577,18 +1590,18 @@ static int setOutputSize(struct context *ctx, const char *optarg) {
  * Default appears to be min=20, max=50. Lower BOTH numbers to increase quality
  * (setting minQuant to 1 roughly doubles the file size)
  */
-static int setQuantLimits(struct context *ctx, const char *optarg) {
+static int setQuantLimits(struct context *ctx, const char *optArg) {
    int minq=0;
    int maxq=0;
 
-   if (optarg!=NULL) {
-      if (sscanf(optarg, "min=%d:max=%d", &minq, &maxq) != 2) {
+   if (optArg!=NULL) {
+      if (sscanf(optArg, "min=%d:max=%d", &minq, &maxq) != 2) {
          fprintf(stderr,"ERROR: Must specify 'min=a:max=b' where 0 < a < b < 52\n");
          return 1;
       }
    }
    if (minq > 0 && maxq > minq && maxq < 52) {
-      printf("Setting quantisation limits to qmin=%d, qmax=%d\n", minq, maxq);
+      fprintf(stderr, "INFO: Setting quantisation limits to qmin=%d, qmax=%d\n", minq, maxq);
       ctx->minQuant=minq;
       ctx->maxQuant=maxq;
       return 0;
@@ -1597,122 +1610,192 @@ static int setQuantLimits(struct context *ctx, const char *optarg) {
    return 1;
 }
 
-/* WARNING: use is made of optag==NULL in parsing the input options. This is a gnu extension */
-static void setupUserOpts(struct context *ctx, int argc, char *argv[]) {
-   int opt, j;
+static int setOutputFormat(struct context *ctx, const char *optArg) {
+   /* List of ffmpeg supported formats: ffmpeg -formats */
+   if (optArg!=NULL) {
+      ctx->formatName=strndup(optArg, 15);
+      return 0;
+   }
+   else {
+      fprintf(stderr, "WARNING: Format specifier expected for option f. Defaulting to matroska (mkv).\n");
+      ctx->formatName=strdup("matroska");
+   }
+   return 1;
+}
+
+static char *getArg(int argc, char *argv[], int *i) {
+   int j=*i+1; /* Next argv[] element */
+   
+   if (argv[*i][2] != '\0')
+      return &argv[*i][2];    /* Argument follows option in same argv[] element */
+
+   if (j > argc)
+      return NULL;            /* Out of array elements: Expected argument missing */
+
+   if (argv[j][0] == '-')
+      return NULL;            /* Next option: Expected argument missing */
+
+   *i=j;
+   return argv[*i];
+}
+
+static int setupUserOpts(struct context *ctx, int argc, char *argv[]) {
+   int i, j;
+   char *optArg;
 
    if (argc < 3)
       usage(argv[0]);
 
+   ctx->oname=NULL;
    ctx->bitrate = 2*1024*1024;   /* Default: 2Mb/s */
    ctx->userAudioStreamIdx=-1;   /* Default: guess audio stream */
    ctx->minQuant=0;              /* Default minimum quantisation: use 0 avoid resetting from firmware default (20?)*/
    ctx->maxQuant=0;              /* Default maximum quantisation: use 0 avoid resetting from firmware default (50?)*/
    ctx->dei_ofpf=1;              /* Deinterlace: set to 0 for one frame per two fields; set to 1 to use one frame per field */
+   ctx->formatName=NULL;         /* Explicit user selected output container format */
 
-   while ((opt = getopt(argc, argv, "a::b:c:d:i:mpq:r:v")) != -1) {
-      switch (opt) {
-      case 'a':
-         ctx->userFlags |= UFLAGS_AUTO_SCALE_X;
-         ctx->userFlags |= UFLAGS_RESIZE;
-         if (optarg!=NULL && *optarg=='y')
-            ctx->userFlags |= UFLAGS_AUTO_SCALE_Y;            
-      break;
-      case 'b':
-         ctx->bitrate = parsebitrate(optarg, ctx->bitrate);
-         if (ctx->bitrate < 128*1024)
-            fprintf(stderr, "WARNING: bit rate too low; use at least 128kb/s!\n", strerror(errno));
-      break;
-      case 'c':
-         if (setCropRectangle(ctx, optarg)==0)
-            ctx->userFlags |= UFLAGS_CROP;
-         else
-            exit(1);
-      break;
-      case 'd':
-         ctx->userFlags |= UFLAGS_DEINTERLACE;
-         if (optarg!=NULL && *optarg=='0')
-            ctx->dei_ofpf=0;
-      break;
-      case 'i':
-         ctx->userAudioStreamIdx=atoi(optarg);
-      break;
-      case 'm':
-         ctx->userFlags |= UFLAGS_MONITOR;
-      break;
-      case 'p':
-         ctx->userFlags |= UFLAGS_MAKE_UP_PTS;
-      break;
-      case 'q':
-         if (setQuantLimits(ctx, optarg)==1)
-            exit(1);
-      break;
-      case 'r':
-         if (setOutputSize(ctx, optarg)==0)
-            ctx->userFlags |= UFLAGS_RESIZE;
-         else
-            exit(1);
-      break;
-      case 'v':
-         ctx->userFlags |= UFLAGS_VERBOSE;
-      break;
-      default:
-         usage(argv[0]);
-      break;
+   i=2;
+   while (i < argc) {
+      if (argv[i][0]=='-') {
+         switch (argv[i][1]) {
+            case 'a':
+               optArg=getArg(argc, argv, &i);
+               ctx->userFlags |= UFLAGS_RESIZE;
+               if (optArg!=NULL && optArg[0]=='y')
+                  ctx->userFlags |= UFLAGS_AUTO_SCALE_Y;
+               else
+                  ctx->userFlags |= UFLAGS_AUTO_SCALE_X;
+            break;
+            case 'b':
+               optArg=getArg(argc, argv, &i);
+               ctx->bitrate = parsebitrate(optArg);
+               if (ctx->bitrate < 0)
+                  return 1;
+            break;
+            case 'c':
+               optArg=getArg(argc, argv, &i);
+               if (setCropRectangle(ctx, optArg)!=0)
+                  return 1;
+               ctx->userFlags |= UFLAGS_CROP;
+            break;
+            case 'd':
+               optArg=getArg(argc, argv, &i);
+               ctx->userFlags |= UFLAGS_DEINTERLACE;
+               if (optArg!=NULL && optArg[0]=='0')
+                  ctx->dei_ofpf=0;
+            break;
+            case 'f':
+               optArg=getArg(argc, argv, &i);
+               setOutputFormat(ctx, optArg);
+            break;
+            case 'h':
+               usage(argv[0]);
+               return 1;
+            break;
+            case 'i':
+               optArg=getArg(argc, argv, &i);
+               if (optArg!=NULL)
+                  ctx->userAudioStreamIdx=atoi(optArg);
+             break;
+            case 'm':
+               ctx->userFlags |= UFLAGS_MONITOR;
+               optArg=getArg(argc, argv, &i);
+               if (optArg!=NULL)
+                  fprintf(stderr, "Unexpected argument %s to option m ignored.\n", argv[i]);
+            break;
+            case 'o':
+               optArg=getArg(argc, argv, &i);
+               if (optArg!=NULL)
+                  ctx->oname=optArg;
+            break;
+            case 'p':
+               ctx->userFlags |= UFLAGS_MAKE_UP_PTS;
+               optArg=getArg(argc, argv, &i);
+               if (optArg!=NULL)
+                  fprintf(stderr, "Unexpected argument %s to option p ignored.\n", argv[i]);
+            break;
+            case 'q':
+               optArg=getArg(argc, argv, &i);
+               if (setQuantLimits(ctx, optArg)==1)
+                  return 1;
+            break;
+            case 'r':
+               optArg=getArg(argc, argv, &i);
+               if (setOutputSize(ctx, optArg)==1)
+                  return 1;
+               ctx->userFlags |= UFLAGS_RESIZE;
+            break;
+            case 'v':
+               ctx->userFlags |= UFLAGS_VERBOSE;
+               optArg=getArg(argc, argv, &i);
+               if (optArg!=NULL)
+                  fprintf(stderr, "Unexpected argument %s to option v ignored.\n", argv[i]);
+            break;
+            default:
+               fprintf(stderr, "Unknown option %s.\n", argv[i]);
+               usage(argv[0]);
+               return 1;
+            break;
+         }
       }
+      i++;
    }
-   if (optind+1 >= argc) {
-      fprintf(stderr, "Expected arguments after options\n");
-      exit(1);
+
+   ctx->iname = argv[1];
+   if (ctx->oname==NULL) {
+      fprintf(stderr, "ERROR: No output name specified!\n");
+      return 1;
    }
-   ctx->iname = argv[optind++];
-   ctx->oname = argv[optind++];
-   j = strlen(ctx->oname);
-   if (strncmp(&(ctx->oname[j-4]), ".nal", 4) == 0 || strncmp(&(ctx->oname[j-4]), ".264", 4) == 0) {
-      ctx->userFlags |= UFLAGS_RAW;
-      ctx->raw_fd = open(ctx->oname, O_CREAT|O_TRUNC|O_WRONLY, 0666);
-      if (ctx->raw_fd == -1) {
-         fprintf(stderr, "Failed to open the output: %s\n", strerror(errno));
-         exit(1);
-      }
+   
+   if (ctx->formatName!=NULL) {
+      if (strncmp(ctx->formatName, "nal", 3) == 0 || strncmp(ctx->formatName, "264", 3) == 0)
+         ctx->userFlags |= UFLAGS_RAW;
    }
+   else {
+      j=strlen(ctx->oname);
+      if (j>4 && (strncmp(&(ctx->oname[j-4]), ".nal", 4) == 0 || strncmp(&(ctx->oname[j-4]), ".264", 4) == 0))
+         ctx->userFlags |= UFLAGS_RAW;
+   }
+   return 0;
 }
 
 static int openInputFile(struct context *ctx) {
    AVFormatContext *ic=NULL;   /* Input context */
    int err;
 
-   //av_register_all();
+#ifdef FFMPEG_LE_4
+   av_register_all();
+#endif
 
    if ((err = avformat_open_input(&ic, ctx->iname, NULL, NULL) != 0)) {
-      fprintf(stderr, "Failed to open '%s': %s\n", ctx->iname, strerror(err));
-      exit(1);
+      fprintf(stderr, "ERROR: Failed to open '%s': %s\n", ctx->iname, strerror(err));
+      return 1;
    }
 
    if (avformat_find_stream_info(ic, NULL) < 0) {
-      fprintf(stderr, "Failed to find streams in '%s'\n", ctx->iname);
+      fprintf(stderr, "ERROR: Failed to find streams in '%s'\n", ctx->iname);
       avformat_close_input(&ic);
-      exit(1);
+      return 1;
    }
 
    ctx->inVidStreamIdx = av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
    if (ctx->inVidStreamIdx < 0) {
-      fprintf(stderr, "Failed to find video stream in '%s'\n", ctx->iname);
+      fprintf(stderr, "ERROR: Failed to find video stream in '%s'\n", ctx->iname);
       avformat_close_input(&ic);
-      exit(1);
+      return 1;
    }
    if (!(ctx->userFlags&UFLAGS_RAW)) {
       ctx->inAudioStreamIdx = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, ctx->userAudioStreamIdx, -1, NULL, 0);
       if (ctx->inAudioStreamIdx < 0) {
-         fprintf(stderr, "Failed to find audio stream in '%s'\n", ctx->iname);
+         fprintf(stderr, "WARNING: Failed to find audio stream in '%s'\n", ctx->iname);
       }
    }
    ctx->ic=ic;
-
-   printf("Input:\n");
+   /* Show input parameters*/
    av_dump_format(ic, 0, ctx->iname, 0);
+   fprintf(stderr,"\n");
 
-   return ic->streams[ctx->inVidStreamIdx]->codecpar->codec_id;   /* Return the codec ID for the video stream */
+   return 0;
 }
 
 static int examineNAL(struct context *ctx) {
@@ -1739,7 +1822,7 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
    pkt.pts=av_rescale_q(ctx->nalEntry.pts, ctx->omxtimebase, ctx->oc->streams[0]->time_base); /* Transform omx pts to output timebase */
    pkt.dts=pkt.pts; /* Out of order b-frames not supported on rpi: so dts=pts */
    ctx->ptsDelta=(ctx->nalEntry.pts-ctx->nalEntry.tick)/1000;
-   //printf("pts:%lld, tick:%lld\n", ctx->nalEntry.pts, ctx->nalEntry.tick);
+   //fprintf(stderr, "pts:%lld, tick:%lld\n", ctx->nalEntry.pts, ctx->nalEntry.tick);
 
    if (nalType==5)   /* This is an IDR frame */
       pkt.flags |= AV_PKT_FLAG_KEY;
@@ -1748,7 +1831,7 @@ static void writeVideoPacket(struct context *ctx, int nalType) {
    if (r != 0) {
       char err[256];
       av_strerror(r, err, sizeof(err));
-      fprintf(stderr,"\nFailed to write a video frame: %s (pts: %lld; nal: %i)\n", err, ctx->nalEntry.pts, nalType);
+      fprintf(stderr,"\nWARNING: Failed to write a video frame: %s (pts: %lld; nal: %i)\n", err, ctx->nalEntry.pts, nalType);
    }
    else ctx->framesOut++; /* This assumes 1 nalu is equivalent to 1 frame */
 }
@@ -1780,7 +1863,8 @@ static void emptyEncoderBuffers(struct context *ctx) {
    }
    else {
       if (ctx->state==OPENOUTPUT && (ctx->encbufs->nFlags & OMX_BUFFERFLAG_CODECCONFIG)) {
-         printf("Examining extradata...\n");
+         if (ctx->userFlags & UFLAGS_VERBOSE)
+            fprintf(stderr, "Examining extradata...\n");
          /* This code was copied from ffmpeg */
          if (av_reallocp(&ctx->oc->streams[0]->codecpar->extradata, ctx->oc->streams[0]->codecpar->extradata_size + ctx->encbufs->nFilledLen + AV_INPUT_BUFFER_PADDING_SIZE) == 0) {
             memcpy(ctx->oc->streams[0]->codecpar->extradata + ctx->oc->streams[0]->codecpar->extradata_size, ctx->encbufs->pBuffer + ctx->encbufs->nOffset, ctx->encbufs->nFilledLen);
@@ -1829,7 +1913,7 @@ static void emptyEncoderBuffers(struct context *ctx) {
             ctx->nalEntry.nalBufOffset = 0;
          }
          else if ( ! ctx->encbufs->nFlags & OMX_BUFFERFLAG_EOS)
-            fprintf(stderr, "\nWarning: End of NAL not found!\n");
+            fprintf(stderr, "\nWARNING: End of NAL not found!\n");
       }
    }
    ctx->encBufferFilled=0;                /* Flag that the buffer is empty */
@@ -1929,14 +2013,35 @@ int main(int argc, char *argv[]) {
    sigset_t set;
    pthread_t sigThread;
 
-   setupUserOpts(&ctx, argc, argv);
+   if (setupUserOpts(&ctx, argc, argv)==1)
+      return 1;
+
+   /* Block SIGINT and SIGQUIT; other threads created by main()
+    * will inherit a copy of the signal mask. */
+
+   sigemptyset(&set);
+   sigaddset(&set, SIGINT);
+   sigaddset(&set, SIGQUIT);
+   i=pthread_sigmask(SIG_BLOCK, &set, NULL);
+   i+=pthread_create(&sigThread, NULL, &sigHandler_thread, (void *) &set);
+   if (i!=0) {
+      fprintf(stderr,"ERROR: signal handling init failed.\n");
+      return 1;
+   }
+
+   i=pthread_mutex_init(&ctx.decBufLock, NULL);
+   if (i!=0) {
+      fprintf(stderr,"ERROR: mutex init failed; exit.\n");
+      return 1;
+   }
+
    ctx.omxtimebase.num=1;
    ctx.omxtimebase.den=1000000; /* OMX timebase is in micro seconds */
    ctx.nalEntry.nalBufSize=1024*1024*2; /* 2MB buffer */
    ctx.nalEntry.nalBuf=av_malloc(ctx.nalEntry.nalBufSize);
    if (ctx.nalEntry.nalBuf==NULL) {
       fprintf(stderr,"ERROR: Can't allocate memory for nalBuf\n");
-      exit(1);
+      return 1;
    }
    ctx.nalEntry.nalBufOffset=0;
    ctx.nalEntry.pts=0;
@@ -1949,23 +2054,16 @@ int main(int argc, char *argv[]) {
 
    TAILQ_INIT(&packetq);
 
-   /* Block SIGINT and SIGQUIT; other threads created by main()
-    * will inherit a copy of the signal mask. */
+   if (openInputFile(&ctx)==1)
+      return 1;
 
-   sigemptyset(&set);
-   sigaddset(&set, SIGINT);
-   sigaddset(&set, SIGQUIT);
-   i=pthread_sigmask(SIG_BLOCK, &set, NULL);
-   i+=pthread_create(&sigThread, NULL, &sigHandler_thread, (void *) &set);
-   if (i!=0) {
-      fprintf(stderr,"signal handling init failed; exit.\n");
-      exit(1);
-   }
-
-   i=pthread_mutex_init(&ctx.decBufLock, NULL);
-   if (i!=0) {
-      fprintf(stderr,"mutex init failed; exit.\n");
-      exit(1);
+   if (ctx.userFlags & UFLAGS_RAW) {
+      ctx.raw_fd = open(ctx.oname, O_CREAT|O_TRUNC|O_WRONLY, 0666);
+      if (ctx.raw_fd == -1) {
+         fprintf(stderr, "ERROR: Failed to open the output file for writing: %s\n", strerror(errno));
+         avformat_close_input(&ctx.ic);
+         return 1;
+      }
    }
 
    atexit(exitHandler); /* Not called if interrupted by a signal */
@@ -1978,12 +2076,12 @@ int main(int argc, char *argv[]) {
    OERR(OMX_GetHandle(&ctx.spl, SPLNAME, &ctx, &splEventCallback));
    OERR(OMX_GetHandle(&ctx.vid, VIDNAME, &ctx, &vidEventCallback));
 
-   openInputFile(&ctx);
    ctx.decbufs=configDecoder(&ctx);
    /* If there is extradata send it to the decoder to have a look at */
    if (ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata!=NULL
          && ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size>0) {
-      printf("** Found extradata in video stream...\n");
+      if (ctx.userFlags & UFLAGS_VERBOSE)
+         fprintf(stderr, "** Found extradata in video stream...\n");
       spare=ctx.decbufs;
       if (ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size < spare->nAllocLen) {
          spare->nFilledLen=ctx.ic->streams[ctx.inVidStreamIdx]->codecpar->extradata_size;
@@ -2019,11 +2117,11 @@ int main(int argc, char *argv[]) {
          exit(1);
          break;
       case TUNNELSETUP:
-         printf("Identified the parameters after %d video frames.\n", j);
+         if (ctx.userFlags & UFLAGS_VERBOSE)
+            fprintf(stderr, "Identified the parameters after %d video frames.\n", j);
          start = time(NULL);
          configure(&ctx);
-  
-         printf("OMX detected %lf fps\n", ctx.omxFPS);
+         fprintf(stderr, "INFO: OMX detected %lf fps\n", ctx.omxFPS);
          pthread_attr_init(&fpsa);
          pthread_attr_setdetachstate(&fpsa, PTHREAD_CREATE_DETACHED);
          pthread_create(&fpst, &fpsa, fps, NULL); /* Run fps calculator in another thread */
@@ -2059,9 +2157,10 @@ int main(int argc, char *argv[]) {
    
    end = time(NULL);
 
-   printf("\nDropped frames: %f\%\n",100*(ctx.framesIn-ctx.framesOut)/ctx.framesIn);
-   printf("Processed %lli frames in %d seconds; %llif/s\n\n\n", ctx.framesOut, end-start, (ctx.framesOut/(end-start)));
-   printf("Time waiting for encoder to finish: %.2lfs\n",(double)ctx.encWaitTime*1E-5);
+   fprintf(stderr, "\n\nDropped frames: %f\%\n",100*(ctx.framesIn-ctx.framesOut)/ctx.framesIn);
+   fprintf(stderr, "Processed %lli frames in %d seconds; %llif/s\n", ctx.framesOut, end-start, (ctx.framesOut/(end-start)));
+   if (ctx.userFlags & UFLAGS_VERBOSE)
+      fprintf(stderr, "Time waiting for encoder to finish: %.2lfs\n",(double)ctx.encWaitTime*1E-5);
    
    if (ctx.oc) {
       av_write_trailer(ctx.oc);

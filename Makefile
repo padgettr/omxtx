@@ -5,6 +5,8 @@ CFLAGS=-Wall -Wno-format -g -I/opt/vc/include/IL -I/opt/vc/include -I/opt/vc/inc
 LDFLAGS=-Xlinker -L/opt/vc/lib/ -Xlinker -L/usr/local/lib -Xlinker -R/usr/local/lib # -Xlinker --verbose
 LIBS=-lavformat -lavcodec -lavutil -lopenmaxil -lbcm_host -lvcos -lpthread
 OFILES=omxtx.o
+# If using ffmpeg < 4.0 uncomment the next line
+#CFLAGS+=-DFFMPEG_LE_4
 
 .PHONY: all clean install dist
 

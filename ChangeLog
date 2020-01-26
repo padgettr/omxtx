@@ -29,3 +29,8 @@ Previous: omxtx.13.c
 05-10-2018: Add option to output one field per frame for interlaced content.
 12-10-2018: Found a bug in using getopt(): if -d was specified without an option it screwed up. Couldn't get optarg() to return an error if no option was specified. Couldn't get it to do proper posix behaviour. Gave up and ended up writing my own command line parser: Note that filename arguments are different now, input file must come first, output file specified by -o option. Other bug corrections and cleanup: If input file not found, just abort imediately - before, encoder / decoder pipeline was still initialised.
 13-01-2019: Added in ability to select output container format and tidy up output. Send all output to stderr (this is what ffmpeg does) so that output file can be specified as /dev/stdout.
+10-01-2020: Fixed bug with option make up pts: account for any difference in timing between audio and video streams.
+            Start looking at other rate control related options: move bitrate control to configureBitRate(). Went through rpi docs and headers, and omx manual, and made notes: OMX_rate_control_parameters.odt
+11-01-2020: Added different rate control options; estimate average bit rate on info line during encode.
+12-01-2020: Tested various available OMX option to try and improve quality on some noisy videos, nothing made a huge difference so keep with defaults. Tests are in configureTestOpts(), but commented out. This is called after configureBitRate().
+

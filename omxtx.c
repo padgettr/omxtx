@@ -37,7 +37,10 @@
  */
 
 /* NOTES: rpi is 32 bit: int and long, int32 are all 4 byte, long long and int64 are 8 byte
- *
+ *        OMX_SetParameter() must be called in either loaded, wait or port disabled states.
+ *        OMX_GetParameter() can be called in any state except invalid.
+ *        OMX_SetConfig() and OMX_GetConfig() can be called in any state except invalid.
+ *        See OpenMAX spec. 1.2 section 3.2.2, table 3-10 for details of macros and allowed states.
  */
 
 //#define DEBUG
@@ -160,6 +163,7 @@ static struct context {
    int      raw_fd;        /* File descriptor for raw output file */
    uint16_t userFlags;      /* User command line switch flags */
    uint64_t framesIn;
+   volatile _Atomic uint64_t curSize;
    volatile _Atomic uint64_t framesOut;
    volatile _Atomic uint64_t ptsDelta; /* Time difference in ms between output pts and omx tick */
    volatile _Atomic uint8_t componentFlags;
@@ -177,7 +181,7 @@ static struct context {
    pthread_mutex_t decBufLock;
    AVBitStreamFilterContext *bsfc;
    int   bitrate;
-   double omxFPS;          /* Output frame rate for display purposes */
+   double omxFPS;          /* Output frame rate */
    char  *iname;
    char  *oname;
    AVRational omxtimebase; /* OMX time base is micro seconds */
@@ -185,11 +189,14 @@ static struct context {
    int outputWidth;
    int outputHeight;
    int naluInputFormat;    /* 1 if input is h264 annexb, 0 otherwise */
-   int minQuant;           /* Minimum allowed quantisation: lower is better quality but bigger file size */
-   int maxQuant;           /* Maximum allowed quantisation */
+   int qMin;           /* Minimum allowed quantisation for VBR mode */
+   int qMax;           /* Maximum allowed quantisation for VBR mode */
    int interlaceMode;
    int dei_ofpf;           /* Deinterlacer: output 1 frame per field */
    const char *formatName; /* Output container format name; may be NULL if specified by filename extension */
+   int controlRateType;    /* Set OMX_VIDEO_CONTROLRATETYPE: only constant quantizer (CQ - OMX_Video_ControlRateDisable) and VBR (OMX_Video_ControlRateVariable - default) supported */
+   int qI;                 /* Set quantisation for CQ mode I frames */
+   int qP;                 /* Set quantisation for CQ mode P frames */
 } ctx;
 
 /* Command line option flags */
@@ -585,7 +592,6 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
    oflow->codecpar->format = mapColour(viddef->eColorFormat);
    oflow->avg_frame_rate = ctx.nalEntry.fps;
    oflow->r_frame_rate = ctx.nalEntry.fps;
-   oflow->start_time=0;
 
    if (ctx.userFlags & UFLAGS_RESIZE) {
       if ((ctx.userFlags & UFLAGS_AUTO_SCALE_X) || (ctx.userFlags & UFLAGS_AUTO_SCALE_Y)) {
@@ -616,7 +622,6 @@ static AVFormatContext *makeOutputContext(AVFormatContext *ic, const char *oname
       if (avcodec_parameters_copy(oflow->codecpar, iflow->codecpar) < 0) /* This copies extradata */
          fprintf(stderr,"ERROR: Copying parameters for audio stream failed.\n");
       oflow->codecpar->codec_tag=0; /* Don't copy FOURCC: Causes problems when remuxing */
-      oflow->start_time=0;
       oflow->time_base = iflow->time_base; /* Time base hint */
    }
    /* Show output format info */
@@ -641,8 +646,8 @@ static void writeAudioPacket(AVPacket *pkt) {
               ctx.ic->streams[ctx.inAudioStreamIdx]->time_base,
               ctx.oc->streams[1]->time_base);
    pkt->dts=pkt->pts; /* Audio packet: dts=pts */
+//   fprintf(stderr,"audioPTS: %lld; timebase: %i/%i\n", ctx.audioPTS, ctx.ic->streams[ctx.inAudioStreamIdx]->time_base.num, ctx.ic->streams[ctx.inAudioStreamIdx]->time_base.den);
 
-   // fprintf(stderr,"Audio PTS %lld\n", pkt->pts);
    ret=av_interleaved_write_frame(ctx.oc, pkt);   /* This frees pkt */
    if (ret < 0) {
       fprintf(stderr, "ERROR:omxtx: Failed to write audio frame.\n");
@@ -871,8 +876,9 @@ static void *fps(void *p) {
    while (ctx.state!=DECEOF) {
       lastframe = ctx.framesOut;
       if (sleep(1)>0) break;
-      fprintf(stderr, "Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims     \r",
-         ctx.framesOut, (double)ctx.framesOut/ctx.omxFPS, ctx.framesOut-lastframe, ctx.ptsDelta);
+      
+      fprintf(stderr, "Frame %6lld (%5.2fs).  Frames last second: %lli   pts delta: %llims  kbps: %5.1f     \r",
+         ctx.framesOut, (double)ctx.framesOut/ctx.omxFPS, ctx.framesOut-lastframe, ctx.ptsDelta, (double)ctx.curSize*8.0*ctx.omxFPS/(1024*ctx.framesOut));
       fflush(stderr);
    }
    fprintf(stderr, "\n");
@@ -1124,16 +1130,199 @@ static OMX_PARAM_PORTDEFINITIONTYPE *configureMonitor(struct context *ctx, OMX_P
    return portdef; /* Unchanged in this case: outputs are a copy of input */
 }
 
+static void configureBitRate(struct context *ctx) {
+   OMX_PARAM_U32TYPE *qMin, *qMax;
+//   OMX_PARAM_U32TYPE *initQuant, *fLimitBits, *peakRate, *encodeQpP;
+   OMX_VIDEO_PARAM_BITRATETYPE *bitrate;
+   OMX_VIDEO_PARAM_QUANTIZATIONTYPE *quantizationType;
+
+   MAKEME(bitrate, OMX_VIDEO_PARAM_BITRATETYPE);
+   bitrate->nPortIndex = PORT_ENC+1;
+   bitrate->eControlRate = ctx->controlRateType;
+   switch (ctx->controlRateType) {
+      case OMX_Video_ControlRateVariable:
+         bitrate->nTargetBitrate = ctx->bitrate;
+      break;
+      case OMX_Video_ControlRateDisable:
+         bitrate->nTargetBitrate = 0;
+      break;
+      case OMX_Video_ControlRateConstant:
+         /* Constant bit rates are only supported on baseline profile
+          * Can't work with CABAC which is enabled on high profile.
+          * i.e. would need to use OMX_VIDEO_AVCProfileBaseline and OMX_VIDEO_AVCLevel3.
+          * I haven't tested this, but others say it works.
+          * Also, there is OMX_IndexConfigBrcmVideoH264DisableCABAC but setting
+          * this doesn't help:
+          * OMX_CONFIG_BOOLEANTYPE *disableCABAC;
+          * MAKEME(disableCABAC, OMX_CONFIG_BOOLEANTYPE);
+          * disableCABAC->bEnabled=OMX_TRUE;
+          * OERR(OMX_SetConfig(ctx->enc, OMX_IndexConfigBrcmVideoH264DisableCABAC, disableCABAC));
+          */
+      default:
+         fprintf(stderr, "ERROR: Rate control mode not supported!\n");
+         exit(1);
+   }
+   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoBitrate, bitrate));
+
+   /* VBR mode settings: note that the target bit rate is still used.
+    * Set target bit rate high to use rate control based on only
+    * qmax / qmin
+    */
+   if (ctx->controlRateType==OMX_Video_ControlRateVariable) {
+      if (ctx->qMin > 0) {
+         MAKEME(qMin, OMX_PARAM_U32TYPE);
+         qMin->nPortIndex = PORT_ENC+1;
+         qMin->nU32 = ctx->qMin;
+         OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeMinQuant, qMin));
+      }
+      if (ctx->qMax > 0) {
+         MAKEME(qMax, OMX_PARAM_U32TYPE);
+         qMax->nPortIndex = PORT_ENC+1;
+         qMax->nU32 = ctx->qMax;
+         OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeMaxQuant, qMax));
+      }
+      /* Used in RC: frames larger than this will be discarded by the encoder */
+      /* Not tested
+      MAKEME(fLimitBits, OMX_PARAM_U32TYPE);
+      fLimitBits->nPortIndex = PORT_ENC+1;
+      fLimitBits->nU32 = 0;
+      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoFrameLimitBits, fLimitBits));
+      */
+
+      /* Used in RC: Peak video bitrate in bits per second.
+       * Must be larger or equal to the average video bitrate.
+       * Ignored for constant bitrate mode
+       */
+      /* Not tested
+      MAKEME(peakRate, OMX_PARAM_U32TYPE);
+      peakRate->nPortIndex = PORT_ENC+1;
+      peakRate->nU32 = 0;
+      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoPeakRate, peakRate));
+      */
+      /* Not tested - I assume this only applies to RC?
+      MAKEME(initQuant, OMX_PARAM_U32TYPE);
+      initQuant->nPortIndex = PORT_ENC+1;
+      initQuant->nU32 = 2;
+      OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamBrcmVideoInitialQuant, initQuant));
+      printf("OMX_IndexParamBrcmVideoInitialQuant: q=%li\n", initQuant->nU32);
+      */
+   }
+
+   /* Constant quantisation mode settings: set target Qp / QI */
+   if (ctx->controlRateType==OMX_Video_ControlRateDisable) {
+      /* This is only used for OMX_Video_ControlRateDisable */
+      /* This seems to be the same as OMX_VIDEO_PARAM_QUANTIZATIONTYPE
+      MAKEME(encodeQpP, OMX_PARAM_U32TYPE);
+      encodeQpP->nPortIndex = PORT_ENC+1;
+      encodeQpP->nU32 = 18;
+      OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeQpP, encodeQpP));
+      printf("OMX_IndexParamBrcmVideoEncodeQpP: q=%li\n", encodeQpP->nU32);
+      */
+      
+      /* This is only used for OMX_Video_ControlRateDisable */
+      MAKEME(quantizationType, OMX_VIDEO_PARAM_QUANTIZATIONTYPE);
+      quantizationType->nPortIndex = PORT_ENC+1;
+      quantizationType->nQpI=ctx->qI;
+      quantizationType->nQpP=ctx->qP;
+      quantizationType->nQpB=0;  /* No B frames on rpi: must be set to 0 */
+      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoQuantization, quantizationType));
+   }
+}
+
+/* This is called after configureBitRate() and is intended to
+ * test available parameters
+ */
+static void configureTestOpts(struct context *ctx) {
+   /* Codec specific settings - not all are supported
+    * loop filter on / off seemed to work (defaults to on)
+    * bUseHadamard seemed to work (defaults to FALSE)
+    */
+/*
+   OMX_VIDEO_PARAM_AVCTYPE *avcSettings;
+   MAKEME(avcSettings, OMX_VIDEO_PARAM_AVCTYPE);
+   avcSettings->nPortIndex = PORT_ENC+1;
+   OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoAvc, avcSettings));
+   avcSettings->eLoopFilterMode=OMX_VIDEO_AVCLoopFilterEnable;
+   avcSettings->bUseHadamard=OMX_FALSE;
+   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoAvc, avcSettings));
+*/
+
+   /* Seems to take values 0-2.9, i.e. probably integer 0, 1 or 2
+    * Seems to affect the strength of the deblocking filter, with 2 being most smoothed
+    */
+/*
+   MAKEME(deblockIDC, OMX_PARAM_U32TYPE);
+   deblockIDC->nPortIndex = PORT_ENC+1;
+   deblockIDC->nU32 = 2;
+   OERR(OMX_SetConfig(ctx->enc, OMX_IndexConfigBrcmVideoH264DeblockIDC, deblockIDC));
+*/
+   
+   /* Takes values 0 to 7: no visible difference on test encode */
+/*
+   MAKEME(intraMB, OMX_PARAM_U32TYPE);
+   intraMB->nPortIndex = PORT_ENC+1;
+   intraMB->nU32 = 0;
+   OERR(OMX_SetConfig(ctx->enc, OMX_IndexConfigBrcmVideoH264IntraMBMode, intraMB));
+*/
+   
+   /* This causes omxtx to hang if set to OMX_TRUE
+    * and blocks HW - had to reboot!
+    * no error in log (/opt/vc/bin/vcdbg log msg)
+    */
+/*
+   OMX_CONFIG_BOOLEANTYPE *lowLat;
+   MAKEME(lowLat, OMX_CONFIG_BOOLEANTYPE);
+   lowLat->bEnabled=OMX_FALSE;
+   OERR(OMX_SetConfig(ctx->enc, OMX_IndexConfigBrcmVideoH264LowLatency, lowLat));
+*/
+   
+   /* This doesn't seem to do anything - probably for VC1 */
+/*
+   MAKEME(dQuant, OMX_PARAM_U32TYPE);
+   dQuant->nPortIndex = PORT_ENC+1;
+   dQuant->nU32 = 0;
+   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoRCSliceDQuant, dQuant));
+*/
+   
+   /* Not supported - returns error code 0x8000101A: OMX_ErrorUnsupportedIndex */
+/*
+   OMX_VIDEO_PARAM_MOTIONVECTORTYPE *mVectorType;
+   MAKEME(mVectorType, OMX_VIDEO_PARAM_MOTIONVECTORTYPE);
+   mVectorType->nPortIndex = PORT_ENC+1;
+   OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoMotionVector, mVectorType));
+   mVectorType->eAccuracy=OMX_Video_MotionVectorPixel;
+   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoMotionVector, mVectorType));
+*/
+
+   /* This is supported */
+/*
+   OMX_VIDEO_PARAM_INTRAREFRESHTYPE *iRefreshType;
+   MAKEME(iRefreshType, OMX_VIDEO_PARAM_INTRAREFRESHTYPE);
+   iRefreshType->nPortIndex = PORT_ENC+1;
+   OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoIntraRefresh, iRefreshType));
+   //iRefreshType->eRefreshMode=OMX_VIDEO_IntraRefreshAdaptive;
+   iRefreshType->eRefreshMode=OMX_VIDEO_IntraRefreshCyclic;
+   iRefreshType->nCirMBs=16;
+   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoIntraRefresh, iRefreshType));
+*/
+
+   /* Not supported - returns error code 0x8000101A: OMX_ErrorUnsupportedIndex */
+/*
+   OMX_VIDEO_PARAM_VBSMCTYPE *variableBlockSizeMC;
+   MAKEME(variableBlockSizeMC, OMX_VIDEO_PARAM_INTRAREFRESHTYPE);
+   variableBlockSizeMC->nPortIndex = PORT_ENC+1;
+   OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoVBSMC, variableBlockSizeMC));
+   variableBlockSizeMC->b16x16=OMX_FALSE;
+   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoVBSMC, variableBlockSizeMC));
+*/
+}
+
 static void configure(struct context *ctx) {
    OMX_VIDEO_PARAM_PROFILELEVELTYPE *level;
-   OMX_VIDEO_PARAM_BITRATETYPE *bitrate;
    OMX_PARAM_PORTDEFINITIONTYPE *portdef;
    OMX_VIDEO_PORTDEFINITIONTYPE *viddef;
    OMX_HANDLETYPE prev; /* Used in setting pipelines: previous handle */
-   OMX_PARAM_U32TYPE *minQuant;
-   OMX_PARAM_U32TYPE *maxQuant;
    OMX_CONFIG_INTERLACETYPE *interlaceType;
-
    int pp;
 
    MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
@@ -1145,9 +1334,10 @@ static void configure(struct context *ctx) {
    ctx->interlaceMode=interlaceType->eMode;
    switch (ctx->interlaceMode) {
       case OMX_InterlaceProgressive: /* mode 0: no need for de-interlacer */
-         fprintf(stderr, "INFO: Progresive scan detected, de-interlacing not required.\n", ctx->interlaceMode);
          if (ctx->userFlags & UFLAGS_DEINTERLACE)
-            ctx->userFlags ^= UFLAGS_DEINTERLACE;
+            fprintf(stderr, "INFO: Progresive scan detected (code=%i), forcing de-interlacer by command line option.\n", ctx->interlaceMode);
+         else
+            fprintf(stderr, "INFO: Progresive scan detected (code=%i), de-interlacing not required.\n", ctx->interlaceMode);
       break;
       case OMX_InterlaceFieldSingleUpperFirst:   /* mode 1: The data is interlaced, fields sent separately in temporal order, with upper field first */
       case OMX_InterlaceFieldSingleLowerFirst:   /* mode 2: The data is interlaced, fields sent separately in temporal order, with lower field first */
@@ -1157,10 +1347,14 @@ static void configure(struct context *ctx) {
             ctx->userFlags ^= UFLAGS_DEINTERLACE;
          }
       break;
-      default:
-         fprintf(stderr, "WARNING: *** Source material is interlaced! Interlace type: %i ***\n", interlaceType->eMode);
+      case OMX_InterlaceFieldsInterleavedUpperFirst:
+      case OMX_InterlaceFieldsInterleavedLowerFirst:
+      case OMX_InterlaceMixed:
+         fprintf(stderr, "WARNING: *** Interlaced source material detected! Interlace type: %i ***\n", interlaceType->eMode);
          fprintf(stderr, "WARNING: *** Consider using the de-interlacer option -d ***\n");
-         // TODO: Switch on interlacer automatically? If so, will need to consider carefully the frame rate: if input is interlaced and 50fps, but omx detects 25fps, it's probably one field per frame and should output with one field per frame.
+      break;
+      default:
+         fprintf(stderr, "WARNING: *** Unknown interlace / progressive scan type: %i ***\n", interlaceType->eMode);
       break;
    }
 
@@ -1228,16 +1422,13 @@ static void configure(struct context *ctx) {
    requestStateChange(ctx->enc, OMX_StateIdle, 1);
 
    /* setup encoder output port  - viddef points to format.video of previous component output port */
-   viddef->nBitrate = ctx->bitrate;
+   viddef->nBitrate = ctx->bitrate; /* Target bit rate for VBR mode; rate control disabled if set to 0; overriden by OMX_IndexParamVideoBitrate below */
    viddef->eCompressionFormat = OMX_VIDEO_CodingAVC;
    portdef->nPortIndex = PORT_ENC+1;
    OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamPortDefinition, portdef));
 
-   MAKEME(bitrate, OMX_VIDEO_PARAM_BITRATETYPE);
-   bitrate->nPortIndex = PORT_ENC+1;
-   bitrate->eControlRate = OMX_Video_ControlRateVariable;
-   bitrate->nTargetBitrate = viddef->nBitrate;
-   OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamVideoBitrate, bitrate));
+   configureBitRate(ctx);
+   configureTestOpts(ctx);
 
    /* Allowed values for pixel aspect are: 1:1, 10:11, 16:11, 40:33, 59:54, and 118:81
     * Note that these aspect ratios do not include overscan.
@@ -1345,20 +1536,6 @@ static void configure(struct context *ctx) {
    level->nPortIndex = PORT_ENC+1;
    OERR(OMX_GetParameter(ctx->enc, OMX_IndexParamVideoProfileLevelCurrent, level));
 
-   if (ctx->minQuant > 0) {
-      MAKEME(minQuant, OMX_PARAM_U32TYPE);
-      minQuant->nU32 = ctx->minQuant;
-      minQuant->nPortIndex = PORT_ENC+1;
-      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeMinQuant, minQuant));
-   }
-
-   if (ctx->maxQuant > 0) {
-      MAKEME(maxQuant, OMX_PARAM_U32TYPE);
-      maxQuant->nU32 = ctx->maxQuant;
-      maxQuant->nPortIndex = PORT_ENC+1;
-      OERR(OMX_SetParameter(ctx->enc, OMX_IndexParamBrcmVideoEncodeMaxQuant, maxQuant));
-   }
-
    /* Get the frame rate at the encoder output
     * This is detected and set by the decoder:
     * seems to be set from stream data if present or from omx ticks
@@ -1459,8 +1636,12 @@ static void usage(const char *name) {
       "   -m    Monitor.  Display the decoder's output\n"
       "   -o O  Output filename with standard container extension, eg. out.mkv\n"
       "   -p    Make up pts. Default is to use input stream dts.\n"
-      "   -q Q  Quantisation limits: 'Q' is specified as min=a:max=b where 0 < a < b < 52.\n"
-      "         Defaults to a=20, b=50 if this option is not used.\n"
+      "   -q Q  Rate control: 'Q' is specified as RC:A:B where:\n"
+      "                       RC is control method: 'V' for VBR mode, 'Q' for contant q (CQ) mode;\n"
+      "                       For VBR: A is minimum quantiser q (minq), B is maximum q (maxq);\n"
+      "                       For CQ : A is q for I frames (qI), B is q for P frames (qP);\n"
+      "                       q must be integer in range 1 - 51; maxq > minq.\n"
+      "         Defaults to VBR with minq=20, maxq=50\n"
       "   -r S  Resize: 'S' is in pixels specified as widthxheight\n"
       "   -v    Verbose: show input / output states of OMX components\n"
       "\n"
@@ -1587,26 +1768,39 @@ static int setOutputSize(struct context *ctx, const char *optArg) {
 }
 
 /* Quantisation options. Range 1 to 51, lower numbers are better quality / bigger file size
- * Default appears to be min=20, max=50. Lower BOTH numbers to increase quality
- * (setting minQuant to 1 roughly doubles the file size)
+ * Hardware default appears to be VBR with min=20, max=50. Lower BOTH numbers to increase quality
+ * Target bit rate will need to be increased if applicable.
  */
-static int setQuantLimits(struct context *ctx, const char *optArg) {
-   int minq=0;
-   int maxq=0;
+static int setQuantOpts(struct context *ctx, const char *optArg) {
+   char optA;
+   int optB;
+   int optC;
 
    if (optArg!=NULL) {
-      if (sscanf(optArg, "min=%d:max=%d", &minq, &maxq) != 2) {
-         fprintf(stderr,"ERROR: Must specify 'min=a:max=b' where 0 < a < b < 52\n");
+      if (sscanf(optArg, "%c:%d:%d", &optA, &optB, &optC) != 3) {
+         fprintf(stderr,"ERROR: Must specify 'RC:qA:qB' where RC=V or Q, and q(A,B) in range 1 - 51\n");
          return 1;
       }
    }
-   if (minq > 0 && maxq > minq && maxq < 52) {
-      fprintf(stderr, "INFO: Setting quantisation limits to qmin=%d, qmax=%d\n", minq, maxq);
-      ctx->minQuant=minq;
-      ctx->maxQuant=maxq;
-      return 0;
+   if (optA=='V' || optA=='v') {
+      if (optB > 0 && optC > optB && optC < 52) {
+         fprintf(stderr, "INFO: Setting VBR mode with quantisation limits: qmin=%d, qmax=%d\n", optB, optC);
+         ctx->controlRateType=OMX_Video_ControlRateVariable;
+         ctx->qMin=optB;
+         ctx->qMax=optC;
+         return 0;
+      }
    }
-   fprintf(stderr,"ERROR: Invalid quantisation parameters! Valid range: 0 < qmin < qmax < 52 \n");
+   if (optA=='Q' || optA=='q') {
+      if (optB > 0 && optC > 0 && optB < 52 && optC <52) {
+         fprintf(stderr, "INFO: Setting CQ mode with quantisation params: qI=%d, qP=%d\n", optB, optC);
+         ctx->controlRateType=OMX_Video_ControlRateDisable;
+         ctx->qI=optB;
+         ctx->qP=optC;
+         return 0;
+      }
+   }
+   fprintf(stderr,"ERROR: Invalid quantisation parameters\n");
    return 1;
 }
 
@@ -1647,12 +1841,15 @@ static int setupUserOpts(struct context *ctx, int argc, char *argv[]) {
       usage(argv[0]);
 
    ctx->oname=NULL;
-   ctx->bitrate = 2*1024*1024;   /* Default: 2Mb/s */
+   ctx->bitrate = 2*1024*1024;   /* Default: 2Mb/s - this will need to be increased if q values below are decreased */
    ctx->userAudioStreamIdx=-1;   /* Default: guess audio stream */
-   ctx->minQuant=0;              /* Default minimum quantisation: use 0 avoid resetting from firmware default (20?)*/
-   ctx->maxQuant=0;              /* Default maximum quantisation: use 0 avoid resetting from firmware default (50?)*/
+   ctx->qMin=20;                 /* Default minimum quantisation for VBR: use 0 for firmware default (20?) */
+   ctx->qMax=50;                 /* Default maximum quantisation for VBR: use 0 for firmware default (50?) */
    ctx->dei_ofpf=1;              /* Deinterlace: set to 0 for one frame per two fields; set to 1 to use one frame per field */
    ctx->formatName=NULL;         /* Explicit user selected output container format */
+   ctx->controlRateType=OMX_Video_ControlRateVariable; /* Default rate control */
+   ctx->qI=20;                   /* Default for CQ mode: controlRateType=OMX_Video_ControlRateDisable */
+   ctx->qP=20;                   /* Default for CQ mode: controlRateType=OMX_Video_ControlRateDisable */
 
    i=2;
    while (i < argc) {
@@ -1716,7 +1913,7 @@ static int setupUserOpts(struct context *ctx, int argc, char *argv[]) {
             break;
             case 'q':
                optArg=getArg(argc, argv, &i);
-               if (setQuantLimits(ctx, optArg)==1)
+               if (setQuantOpts(ctx, optArg)==1)
                   return 1;
             break;
             case 'r':
@@ -1916,6 +2113,7 @@ static void emptyEncoderBuffers(struct context *ctx) {
             fprintf(stderr, "\nWARNING: End of NAL not found!\n");
       }
    }
+   ctx->curSize+=ctx->encbufs->nFilledLen;
    ctx->encBufferFilled=0;                /* Flag that the buffer is empty */
    ctx->encbufs->nFilledLen = 0;
    ctx->encbufs->nOffset = 0;
@@ -1961,14 +2159,14 @@ void fillDecBuffers(struct context *ctx, int i, AVPacket *p) {
    int64_t omxTicks;
 
    /* From ffmpeg docs: pkt->pts can be AV_NOPTS_VALUE (-9223372036854775808) if the video format has B-frames, so it is better to rely on pkt->dts if you do not decompress the payload */
-   if ( !(ctx->userFlags & UFLAGS_MAKE_UP_PTS) && p->dts != AV_NOPTS_VALUE)
+   if ( !(ctx->userFlags & UFLAGS_MAKE_UP_PTS) && p->dts > ctx->videoPTS)
       ctx->videoPTS=p->dts;
    else
       ctx->videoPTS+=p->duration; /* Use packet duration */
 
    omxTicks=av_rescale_q(ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base, ctx->omxtimebase); /* Transform input timebase to omx timebase */
 
-   //fprintf(stderr,"Input pts: %lld; timebase: %i/%i\n", ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.num, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.den);
+//   fprintf(stderr,"videoPTS: %lld; timebase: %i/%i\n", ctx->videoPTS, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.num, ctx->ic->streams[ctx->inVidStreamIdx]->time_base.den);
    tick.nLowPart = (uint32_t) (omxTicks & 0xffffffff);
    tick.nHighPart = (uint32_t) ((omxTicks & 0xffffffff00000000) >> 32);
 
@@ -2045,6 +2243,7 @@ int main(int argc, char *argv[]) {
    }
    ctx.nalEntry.nalBufOffset=0;
    ctx.nalEntry.pts=0;
+   ctx.curSize=0;
    ctx.framesOut=0;
    ctx.framesIn=0;
    ctx.componentFlags=0;
@@ -2093,8 +2292,19 @@ int main(int argc, char *argv[]) {
          fprintf(stderr,"WARNING: extradata too big for input buffer - ignoring...\n");
    }
 
-   ctx.audioPTS=0;
-   ctx.videoPTS=0;
+   ctx.audioPTS=ctx.ic->streams[ctx.inAudioStreamIdx]->start_time;
+   ctx.videoPTS=ctx.ic->streams[ctx.inVidStreamIdx]->start_time;
+   if (ctx.userFlags & UFLAGS_MAKE_UP_PTS) {
+      if (ctx.audioPTS>ctx.videoPTS) { /* Audio starts later than video */
+         ctx.audioPTS=ctx.audioPTS-ctx.videoPTS;
+         ctx.videoPTS=0;
+      }
+      else {
+         ctx.videoPTS=ctx.videoPTS-ctx.audioPTS;
+         ctx.audioPTS=0;
+      }
+   }
+      
    /* Feed the decoder frames until the parameters are identified and port 131 changes state */
    for (j=0; ctx.state!=TUNNELSETUP; j++) {
       p=getNextVideoPacket(&ctx);

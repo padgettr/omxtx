@@ -13,5 +13,11 @@ Why won't vp8 / mjpeg decode work?
   is required in /boot/config.txt. Note that these are not hardware decoders, they are built into the firmware as software decoders running on the gpu, so expect little cpu usage.
 
 My input is 50fps interlaced, but the output is only 25fps with or without the deinterlacer.
-* It seems that some files are encoded such that ffmpeg detects them as 50 fps, but this is really 50 fields per seconds, two fields making up one frame. The omx decoder detects the frame rate, wich will be half in this case. By default, the de-interlacer id set to output one frame for the two interlaced fields. This can be changed by passing the -d0 option, increasing the output to 50fps deinterlaced.
+* It seems that some files are encoded such that ffmpeg detects them as 50 fps, but this is really 50 fields per seconds, two fields making up one frame. The omx decoder detects the frame rate, wich will be half in this case. By default, the de-interlacer is set to output one frame for the two interlaced fields. This can be changed by passing the -d0 option, increasing the output to 50fps deinterlaced.
  
+How is bit rate calculated on the info line?
+* This is an estimate based on the average frame size in bits * frame rate
+  Doesn't include the audio stream.
+
+Why is there no contant bit rate (CBR) mode?
+* This is only supported on the PI for h264 baseline profiles - this code uses the default high profile, so CBR is not available.

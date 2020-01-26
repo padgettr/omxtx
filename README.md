@@ -34,7 +34,7 @@ and as such has only received significant testing for mpeg files ripped from dvd
 format of h264 in a matroska container, e.g:
 
 ```
-./omxtx test.vob -ay -c 720:480:0:80 test.mkv
+./omxtx test.vob -ay -c 720:480:0:80 -o test.mkv
 ```
 Run omxtx -h for a full list of options and usage.
 
@@ -52,7 +52,7 @@ This version has an enhanced deinterlace capability, and can output 1 frame per 
 It has been tested with mpeg2 avi/mkv, divx avi, mjpeg avi input all to h264 mkv output.
 WARNING: Some audio desync was noted with pcm audio input streams! All AC3 was OK.
 
-Dr. R. Padgett, October 2018
+Dr. R. Padgett, December 2019
 
 Copyright
 =========

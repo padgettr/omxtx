@@ -2,7 +2,7 @@ omxtx
 =====
 UPDATE 16-12-2024:
 This project has not been tested for a long time and will likely not work on recent versions of linux for the raspberry pi (rpi). Instead, I suggest the ffmpeg interface for the video for linux drivers recently added to the rpi kernel. For example:
-ffmpeg -y -i <INPUT file> -r 25 -filter:v crop=720:416:0:80,scale=1024x416 -c:v h264_v4l2m2m -num_capture_buffers 128 -qmin 24 -qmax 31 -b:v 10M -c:a copy out.mp4
+ffmpeg -y -i input.mkv -r 25 -filter:v crop=720:416:0:80,scale=1024x416 -c:v h264_v4l2m2m -num_capture_buffers 128 -qmin 24 -qmax 31 -b:v 10M -c:a copy out.mp4
 
 Note that only some output containers will work (mkv reported errors, mp4 was OK) and only certain video sizes are valid (encodes, but corrupted). From my experiments (end of 2022) the following applies:
         Scaled widths:
